@@ -15,6 +15,12 @@ Abra `INICIAR.bat`. É necessário Python 3.11 a 3.14, 64 bits (recomendado: 3.1
 5. Arraste para girar, use a roda para zoom e Ctrl + arraste para deslocar. Há vistas superior/lateral, três materiais e exibição da malha.
 6. Clique **Exportar STL** quando o indicador informar que o modelo está atualizado. A exportação fica indisponível enquanto há alterações pendentes. STL não guarda unidades: selecione milímetros no CAD/fatiador.
 
+## Pé e mapa de pressão
+
+No seletor acima da visualização, escolha **Pé 3D** para exibir um relevo anatômico sobre a palmilha. O contorno acompanha exatamente a malha da palmilha, incluindo comprimento e largura. Volume do peito do pé, tornozelo e relevo dos dedos podem ser ajustados nos controles. O modelo é uma referência visual paramétrica; ele não é uma digitalização do pé e não é incluído no STL da palmilha.
+
+Escolha **Pressão estimada** para ver um mapa de cores na superfície da palmilha. Os controles ajustam a intensidade relativa no calcanhar, mediopé, metatarsos e dedos. A distribuição é uma ilustração ajustável, não uma medição de pressão plantar. Medidas reais exigem sensores ou uma palmilha instrumentada e validação profissional.
+
 ## Geometria e desempenho
 
 O contorno é extraído em até 900 px, reamostrado e suavizado com filtro periódico. A triangulação restrita respeita as concavidades e acrescenta vértices internos; a base e as paredes fecham a malha. O comprimento informado é mantido após a suavização. A largura acompanha a proporção da imagem.

@@ -49,6 +49,84 @@ def button(text, callback, primary=False):
     return item
 
 
+def foot_surface(sole_vertices, sole_faces, parameters, height, ankle, toe_relief):
+    """Sculpt a foot relief over the exact triangulated footprint of the insole."""
+    count = len(sole_vertices)//2
+    sole = sole_vertices[:count]
+    lo, hi = sole[:,:2].min(axis=0), sole[:,:2].max(axis=0)
+    u = (sole[:,0]-lo[0])/max(hi[0]-lo[0],1e-6)
+    t = (hi[1]-sole[:,1])/max(hi[1]-lo[1],1e-6)  # toe=0, heel=1
+    medial = .72 if parameters['side']=='Esquerdo' else .28
+    across = np.maximum(0,np.sin(np.pi*np.clip(u,0,1)))**.55
+    def g(x,center,width):
+        return np.exp(-.5*((x-center)/width)**2)
+
+    # Instep, ball and heel form one continuous dorsum; the heel rises into an ankle.
+    dorsum = height*(.60*g(t,.54,.25)+.48*g(t,.25,.15))
+    arch_bias = .12*height*g(t,.56,.20)*g(u,medial,.24)
+    ankle_rise = ankle*g(t,.90,.13)
+    relief = across*(dorsum+arch_bias+ankle_rise)
+
+    # Five rounded toe pads with a wider, longer big toe and shallow web grooves.
+    centers = ([.77,.61,.48,.35,.22] if parameters['side']=='Esquerdo'
+               else [.23,.39,.52,.65,.78])
+    toe_t = [.075,.09,.105,.125,.145]
+    toe_w = [.105,.082,.073,.065,.055]
+    toe_h = [1,.84,.76,.68,.58]
+    toes = np.zeros_like(relief)
+    for cx,cy,sx,amp in zip(centers,toe_t,toe_w,toe_h):
+        toes += amp*g(u,cx,sx)*g(t,cy,.072)
+    grooves = np.zeros_like(relief)
+    for left,right in zip(centers[:-1],centers[1:]):
+        grooves += g(u,(left+right)/2,.018)*g(t,.105,.082)
+    relief += across*toe_relief*np.maximum(0,toes-.82*grooves)
+
+    upper = sole.copy()
+    upper[:,2] += relief
+    lower = sole.copy()
+    faces = sole_faces[(sole_faces < count).all(axis=1)]
+    # Keep the complete foot seated: every point on the insole perimeter touches it.
+    edges = np.vstack([faces[:,[0,1]],faces[:,[1,2]],faces[:,[2,0]]])
+    unique_edges,edge_counts = np.unique(np.sort(edges,axis=1),axis=0,return_counts=True)
+    boundary = np.unique(unique_edges[edge_counts==1])
+    upper[boundary,2] = sole[boundary,2]
+    n = len(upper)
+    closed_faces = np.vstack([faces,faces[:,::-1]+n]).astype(np.int32)
+    vertices = np.vstack([upper,lower])
+
+    # Subtle lighter nail patches make the five toe tips legible in the 3D view.
+    base = np.array([.84,.55,.40,1.])
+    nail = np.array([.96,.77,.68,1.])
+    nail_strength = np.zeros(count)
+    for i,(cx,cy,sx) in enumerate(zip(centers,[.027,.039,.052,.065,.079],toe_w)):
+        nail_strength = np.maximum(nail_strength,g(u,cx,sx*.43)*g(t,cy,.027))
+    colors = np.tile(base,(count,1))
+    colors = colors*(1-nail_strength[:,None]*.78)+nail*nail_strength[:,None]*.78
+    crease_strength = np.clip(grooves,0,1)*.26
+    colors[:,:3] *= (1-crease_strength[:,None])
+    return vertices,closed_faces,colors
+
+
+def pressure_colors(sole_vertices, side, levels):
+    """Return an adjustable illustrative pressure field, not measured data."""
+    lo, hi = sole_vertices.min(axis=0), sole_vertices.max(axis=0)
+    width, length = hi[0]-lo[0], hi[1]-lo[1]
+    u = (sole_vertices[:,0]-lo[0])/max(width,1e-6)
+    v = (hi[1]-sole_vertices[:,1])/max(length,1e-6)
+    medial = .72 if side=='Esquerdo' else .28
+    def spot(cx, cy, sx, sy):
+        return np.exp(-.5*((u-cx)/sx)**2-.5*((v-cy)/sy)**2)
+    field = (levels[0]*spot(.50,.88,.22,.11) +
+             levels[1]*spot(medial,.56,.20,.13) +
+             levels[2]*(spot(.34,.29,.13,.09)+spot(.66,.29,.13,.09))*.5 +
+             levels[3]*spot(.53,.09,.18,.09))
+    field /= max(float(field.max()),1e-9)
+    stops = np.array([0,.25,.5,.75,1.])
+    palette = np.array([[.08,.24,.72,.78],[.05,.75,.91,.82],[.20,.78,.44,.86],
+                        [1.,.82,.12,.90],[.92,.12,.10,.94]])
+    return np.column_stack([np.interp(field,stops,palette[:,i]) for i in range(4)])
+
+
 class Preview(W.QWidget):
     changed = C.Signal()
     def __init__(self):
@@ -164,6 +242,9 @@ class App(W.QMainWindow):
         self.source = demo_image()
         self.mesh = None
         self.mesh_item = None
+        self.foot_item = None
+        self.pressure_item = None
+        self.overlay_mode = 0
         self.dimension_items = []
         self.revision = 0
         self.busy = False
@@ -248,6 +329,44 @@ class App(W.QMainWindow):
         self.side.addItems(['Esquerdo','Direito'])
         self.side.currentTextChanged.connect(self.schedule)
         controls.addWidget(self.side)
+        controls.addWidget(label('03  /  PÉ E PRESSÃO ESTIMADA','section'))
+        controls.addWidget(label('O contorno do pé acompanha exatamente o contorno da palmilha.','muted'))
+        self.foot_values = {}
+        for title,key,value,low,high,step in [
+            ('Volume do peito do pé · mm','height',42,15,80,1),
+            ('Volume do tornozelo · mm','ankle',30,5,60,1),
+            ('Separação dos dedos · mm','toe_relief',16,0,28,1)]:
+            row = W.QHBoxLayout()
+            row.addWidget(label(title))
+            field = W.QDoubleSpinBox()
+            field.setRange(low,high)
+            field.setDecimals(0)
+            field.setSingleStep(step)
+            field.setValue(value)
+            field.setFixedWidth(94)
+            field.valueChanged.connect(self.update_overlay)
+            self.foot_values[key] = field
+            row.addWidget(field)
+            controls.addLayout(row)
+        controls.addWidget(label('Intensidade relativa por região','muted'))
+        self.pressure_values = {}
+        for title,key,value in [
+            ('Calcanhar','heel',80),('Arco / mediopé','midfoot',20),
+            ('Metatarsos','forefoot',70),('Dedos','toes',40)]:
+            row = W.QHBoxLayout()
+            row.addWidget(label(title))
+            field = W.QDoubleSpinBox()
+            field.setRange(0,100)
+            field.setDecimals(0)
+            field.setSingleStep(5)
+            field.setValue(value)
+            field.setSuffix(' %')
+            field.setFixedWidth(94)
+            field.valueChanged.connect(self.update_overlay)
+            self.pressure_values[key] = field
+            row.addWidget(field)
+            controls.addLayout(row)
+        controls.addWidget(label('Mapa ilustrativo, sem sensores: não mede a pressão real nem substitui avaliação clínica.','muted'))
         controls.addWidget(button('↕  Inverter ponta e calcanhar',self.flip))
         controls.addWidget(label('Ponta para cima, calcanhar para baixo. O lado selecionado posiciona o arco.','muted'))
         controls.addStretch()
@@ -265,6 +384,10 @@ class App(W.QMainWindow):
         for name,angles in [('Perspectiva',(36,-48)),('Superior',(90,-90)),('Lateral',(5,0))]:
             views.addWidget(button(name,lambda checked=False,a=angles:self.view(*a)))
         views.addStretch()
+        self.view_mode = W.QComboBox()
+        self.view_mode.addItems(['Palmilha','Pé 3D','Pressão estimada'])
+        self.view_mode.currentIndexChanged.connect(self.update_overlay)
+        views.addWidget(self.view_mode)
         self.wire = W.QCheckBox('Malha')
         self.wire.toggled.connect(self.appearance)
         views.addWidget(self.wire)
@@ -334,6 +457,11 @@ class App(W.QMainWindow):
             if self.mesh_item:
                 self.viewer.removeItem(self.mesh_item)
                 self.mesh_item = None
+            for attr in ('foot_item','pressure_item'):
+                item = getattr(self,attr,None)
+                if item is not None:
+                    self.viewer.removeItem(item)
+                    setattr(self,attr,None)
             self.metrics.setText('Ajuste a imagem ou marque o contorno.')
             return
         image,mask,self.mesh,render_data,elapsed = result
@@ -360,6 +488,7 @@ class App(W.QMainWindow):
         self.status.setText(f'Contorno suavizado  •  {len(f):,} triângulos  •  geração em {elapsed*1000:.0f} ms  •  STL em milímetros')
         self.badge.setText('●  MODELO ATUALIZADO')
         self.export_button.setEnabled(True)
+        self.update_overlay()
 
     def appearance(self,*args):
         if self.mesh_item:
@@ -368,6 +497,44 @@ class App(W.QMainWindow):
             self.mesh_item.opts['drawEdges'] = self.wire.isChecked()
             self.mesh_item.opts['edgeColor'] = (.12,.22,.27,.25)
             self.mesh_item.meshDataChanged()
+
+    def update_overlay(self,*args):
+        if self.mesh is None or self.mesh_item is None or not hasattr(self,'view_mode'):
+            return
+        mode = self.view_mode.currentIndex()
+        if mode != self.overlay_mode:
+            self.overlay_mode = mode
+            if mode == 1:
+                self.view(36,-48)
+        if self.foot_item is not None:
+            self.viewer.removeItem(self.foot_item)
+            self.foot_item = None
+        if self.pressure_item is not None:
+            self.viewer.removeItem(self.pressure_item)
+            self.pressure_item = None
+        vertices,faces = self.mesh
+        if mode == 1:
+            params = self.parameters()
+            foot_v,foot_f,foot_colors = foot_surface(vertices,faces,params,
+                self.foot_values['height'].value(),self.foot_values['ankle'].value(),
+                self.foot_values['toe_relief'].value())
+            foot_colors = np.vstack([foot_colors,np.tile([.84,.55,.40,1.],(len(foot_colors),1))])
+            self.foot_item = gl.GLMeshItem(vertexes=foot_v,faces=foot_f,vertexColors=foot_colors,
+                smooth=True,shader=self.surface_shader,
+                drawEdges=False,computeNormals=True)
+            self.viewer.addItem(self.foot_item)
+        elif mode == 2:
+            top_count = len(vertices)//2
+            top_vertices = vertices[:top_count].copy()
+            face_heights = vertices[faces,2]
+            top_faces = faces[(face_heights > 0).all(axis=1)]
+            top_vertices[:,2] += .16
+            levels = [self.pressure_values[k].value()/100 for k in ('heel','midfoot','forefoot','toes')]
+            colors = pressure_colors(top_vertices,self.side.currentText(),levels)
+            data = gl.MeshData(vertexes=top_vertices,faces=top_faces,vertexColors=colors)
+            self.pressure_item = gl.GLMeshItem(meshdata=data,smooth=True,
+                shader=self.surface_shader,drawEdges=False,computeNormals=True)
+            self.viewer.addItem(self.pressure_item)
 
     def view(self,elevation,azimuth):
         self.viewer.opts['center'] = G.QVector3D(0,0,0)

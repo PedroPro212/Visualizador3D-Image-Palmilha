@@ -23,17 +23,59 @@ try {
         & $runtime -m venv .venv-studio
         if ($LASTEXITCODE -ne 0) { throw 'Nao foi possivel criar o ambiente Python.' }
     }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $python -c 'import pip, pip._vendor.urllib3' 2>$null
+    $pipCheckExitCode = $LASTEXITCODE
+    if ($pipCheckExitCode -ne 0) {
+        Write-Host 'Reparando o instalador Python...'
+        $sitePackages = & $python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+        if ($LASTEXITCODE -ne 0 -or -not $sitePackages) { throw 'Nao foi possivel localizar os arquivos do pip.' }
+        Remove-Item -LiteralPath (Join-Path $sitePackages 'pip') -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $sitePackages -Directory -Filter 'pip-*.dist-info' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        & $python -m ensurepip --upgrade 2>$null
+        $repairExitCode = $LASTEXITCODE
+        & $python -c 'import pip, pip._vendor.urllib3' 2>$null
+        $pipCheckExitCode = $LASTEXITCODE
+    }
+    $ErrorActionPreference = $previousErrorActionPreference
+    if ($pipCheckExitCode -ne 0) { throw 'Nao foi possivel reparar o pip. Verifique a instalacao do Python 3.11 a 3.14 e tente novamente.' }
+
     $stamp = Join-Path $PSScriptRoot '.venv-studio\requirements.sha256'
     $hash = (Get-FileHash requirements.txt -Algorithm SHA256).Hash
     if (-not (Test-Path $stamp) -or (Get-Content $stamp -Raw).Trim() -ne $hash) {
         Write-Host 'Preparando o Palmilha Studio. A primeira execucao precisa de internet...'
+        $ErrorActionPreference = 'Continue'
         & $python -m pip install -r requirements.txt
-        if ($LASTEXITCODE -ne 0) { throw 'Falha ao instalar bibliotecas. Verifique sua conexao.' }
+        $installExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($installExitCode -ne 0) { throw 'Falha ao instalar bibliotecas. Verifique sua conexao.' }
         Set-Content $stamp $hash
     }
+
+    $opencvPreviousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $python -c 'import cv2' 2>$null
+    $opencvCheckExitCode = $LASTEXITCODE
+    if ($opencvCheckExitCode -ne 0) {
+        Write-Host 'OpenCV incompleto. Reinstalando...'
+        & $python -m pip install --force-reinstall --no-deps 'opencv-python-headless>=4.10,<6'
+        $opencvInstallExitCode = $LASTEXITCODE
+        if ($opencvInstallExitCode -eq 0) {
+            & $python -c 'import cv2' 2>$null
+            $opencvCheckExitCode = $LASTEXITCODE
+        }
+    }
+    $ErrorActionPreference = $opencvPreviousPreference
+    if ($opencvCheckExitCode -ne 0) { throw 'Nao foi possivel reparar o OpenCV. Verifique a conexao e tente novamente.' }
+
     & $python app.py
     if ($LASTEXITCODE -ne 0) { throw 'O aplicativo encerrou com erro. Confira a mensagem acima.' }
 } catch {
     Write-Host $_ -ForegroundColor Red
     exit 1
 }
+
+
+
