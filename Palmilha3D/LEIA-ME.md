@@ -1,39 +1,30 @@
-# Palmilha3D
+# Palmilha Studio
 
-Aplicativo desktop em Python com interface em português. Importa JPG, JPEG e PNG, extrai a silhueta, cria um volume com base plana e permite girar, ampliar e exportar STL em milímetros. Funciona localmente; as imagens não são enviadas para serviços externos.
+Aplicativo desktop local para transformar a silhueta de uma imagem em uma palmilha 3D suave e exportar STL em milímetros. Interface em português com Qt e visualização OpenGL.
 
-## Executar no Windows
+## Iniciar
 
-Instale Python 3.11 ou superior, incluindo Tcl/Tk e Python Launcher. Extraia toda a pasta e abra `INICIAR.bat`. Na primeira execução, a conexão com a internet é necessária para instalar as dependências em um ambiente virtual dentro desta pasta.
+Abra `INICIAR.bat`. É necessário Python 3.11 a 3.14, 64 bits (recomendado: 3.12). O iniciador procura instalações compatíveis e cria `.venv-studio` separadamente do ambiente antigo. A primeira execução instala as dependências e precisa de internet. As próximas abrem direto, sem reinstalar pacotes. Se disponível, o Python 3.12 do runtime local do Codex também pode ser utilizado.
 
-Alternativa pelo terminal nesta pasta:
+## Fluxo
 
-```powershell
-py -3 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe app.py
-```
+1. Importe ou arraste PNG/JPG/JPEG. Use uma foto vista de cima, fundo uniforme e sem sombras, ou PNG transparente. A imagem é processada localmente e não é enviada a serviços externos.
+2. Confira a aba **Contorno detectado**. A maior região conectada é preservada; furos internos são preenchidos. Imagens horizontais são giradas para definir o comprimento. Confira ponta e calcanhar.
+3. Se necessário, selecione **Marcar contorno**, clique ao redor da palmilha na imagem original e pressione **Concluir**. **Restaurar detecção automática** descarta os pontos manuais.
+4. Informe o comprimento real em mm. Ajuste espessura, calcanhar, arco e lado. Os ajustes atualizam o modelo automaticamente. Suavização maior arredonda pequenas irregularidades e pode remover detalhes; valores menores preservam mais o contorno.
+5. Arraste para girar, use a roda para zoom e Ctrl + arraste para deslocar. Há vistas superior/lateral, três materiais e exibição da malha.
+6. Clique **Exportar STL** quando o indicador informar que o modelo está atualizado. A exportação fica indisponível enquanto há alterações pendentes. STL não guarda unidades: selecione milímetros no CAD/fatiador.
 
-## Usar
+## Geometria e desempenho
 
-1. O aplicativo inicia com uma silhueta demonstrativa. Abra uma foto da palmilha vista de cima, sobre fundo uniforme, sem sombras, objetos ou textos. PNG com transparência também é aceito.
-2. Oriente a ponta para cima e o calcanhar para baixo. Imagens horizontais são giradas automaticamente; confira o resultado e use **Inverter ponta e calcanhar** se necessário. O eixo mais longo é considerado o comprimento; não há correção de perspectiva.
-3. Ajuste a tolerância de separação do fundo. Se necessário, use **Marcar contorno manual**, clique sequencialmente ao redor da borda na miniatura e pressione **Concluir contorno**. A seleção usa a imagem original como referência e é fechada automaticamente. Para recomeçar, clique novamente em Marcar contorno manual. Reabra a imagem para voltar à detecção automática.
-4. Informe o comprimento real e ajuste a espessura mínima e as elevações adicionais do calcanhar e do arco. O lado escolhido move o arco para a região medial correspondente; confira visualmente. Clique em **Gerar / atualizar 3D**.
-5. Arraste a visualização para girar e use a roda do mouse para ampliar. Os botões Superior e Lateral permitem conferir o perfil.
-6. Exporte STL para abrir em um programa de CAD ou fatiador. Selecione milímetros ao importar: o formato STL não armazena a unidade.
+O contorno é extraído em até 900 px, reamostrado e suavizado com filtro periódico. A triangulação restrita respeita as concavidades e acrescenta vértices internos; a base e as paredes fecham a malha. O comprimento informado é mantido após a suavização. A largura acompanha a proporção da imagem.
 
-## Como o modelo é gerado
+Qt/OpenGL mantém a malha na visualização acelerada por hardware, com normais interpoladas. Geração ocorre em uma fila de trabalho separada da interface. Ajustes próximos são agrupados por 220 ms, resultados antigos são descartados e a máscara é reutilizada quando somente as medidas mudam. Não há laço de redesenho contínuo enquanto a cena está parada. Desempenho depende de GPU/driver, imagem e dimensões; não há garantia universal de FPS.
 
-A detecção automática estima a cor do fundo pelos cantos e mantém a maior região conectada, preenchendo furos. O contorno é amostrado em uma grade de 72 células de comprimento. A largura acompanha a proporção da silhueta. A superfície superior recebe elevações suaves parametrizadas; paredes laterais e base fecham a malha. Bordas podem apresentar discretização visível. Esta versão prioriza uma prévia editável e exportação simples; não implementa edição CAD de curvas ou reconstrução fotogramétrica.
+Uma única imagem não contém as alturas reais. O resultado preserva a silhueta e usa uma superfície paramétrica para arco e calcanhar. Não há reconstrução fotogramétrica, correção de perspectiva, cópia de textura ou reprodução do algoritmo proprietário do GenSole. Para uso funcional, as medidas e a forma exigem validação apropriada.
 
-Uma imagem isolada não revela a altura real nem a anatomia do pé. As elevações são parâmetros geométricos, não medições extraídas da foto. Este aplicativo não replica o algoritmo do GenSole nem fornece prescrição ortopédica. A fabricação e o uso de uma palmilha funcional precisam de medidas e validação apropriadas.
+## Validação
 
-## Arquivos
+` .venv-studio\Scripts\python.exe -m unittest test_core -v `
 
-- `app.py`: interface e visualização 3D em Tkinter.
-- `core.py`: contorno, geração de malha e STL binário.
-- `test_core.py`: verificações de fechamento, orientação, escala e exportação.
-- `exemplo.png` e `exemplo.stl`: demonstração pronta para conferir.
-
-Teste do núcleo: `python -m unittest test_core -v`.
+Testes verificam fechamento, orientação, escala, transparência, seleção manual, preservação de concavidades e escrita do STL. `test_ui.py` exercita a interface com uma janela temporária e salva uma captura somente se `PALMILHA_SCREENSHOT` estiver definido.

@@ -1,39 +1,22 @@
-"""Processamento local de silhuetas e malha fechada, em milímetros."""
-from collections import deque
+"""Contorno suave, triangulação restrita e STL em milímetros."""
 import struct
+import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
+from scipy.ndimage import gaussian_filter1d
+import triangle
 
 
 def largest_component(mask):
-    h, w = mask.shape
-    seen = np.zeros_like(mask, dtype=bool)
-    best = []
-    for y, x in zip(*np.where(mask)):
-        if seen[y, x]:
-            continue
-        q = deque([(y, x)])
-        seen[y, x] = True
-        part = []
-        while q:
-            a, b = q.popleft()
-            part.append((a, b))
-            for c, d in ((a-1,b),(a+1,b),(a,b-1),(a,b+1)):
-                if 0 <= c < h and 0 <= d < w and mask[c,d] and not seen[c,d]:
-                    seen[c,d] = True
-                    q.append((c,d))
-        if len(part) > len(best):
-            best = part
-    result = np.zeros_like(mask, dtype=bool)
-    if best:
-        yy, xx = zip(*best)
-        result[yy, xx] = True
-    return result
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype('uint8'), 8)
+    return labels == (1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])) if n > 1 else np.zeros_like(mask, dtype=bool)
 
 
 def extract_mask(image, tolerance=45, polygon=None):
-    im = image.copy().convert('RGBA')
-    im.thumbnail((420,420))
+    if not np.isfinite(tolerance) or not 0 <= tolerance <= 441:
+        raise ValueError('A tolerância deve estar entre 0 e 441.')
+    im = ImageOps.exif_transpose(image).convert('RGBA')
+    im.thumbnail((900, 900), Image.Resampling.LANCZOS)
     if polygon:
         m = Image.new('L', im.size)
         ImageDraw.Draw(m).polygon([(x*im.width,y*im.height) for x,y in polygon], fill=255)
@@ -43,78 +26,86 @@ def extract_mask(image, tolerance=45, polygon=None):
         if (a[:,:,3] < 128).any():
             mask = a[:,:,3] > 128
         else:
-            rgb = a[:,:,:3].astype(float)
+            rgb = a[:,:,:3].astype(np.float32)
             corners = np.concatenate([rgb[:5,:5].reshape(-1,3),rgb[:5,-5:].reshape(-1,3),rgb[-5:,:5].reshape(-1,3),rgb[-5:,-5:].reshape(-1,3)])
-            bg = np.median(corners,axis=0)
-            mask = np.linalg.norm(rgb-bg,axis=2) > tolerance
+            mask = np.linalg.norm(rgb-np.median(corners,axis=0),axis=2) > tolerance
     mask = largest_component(mask)
     if mask.sum() < 80:
-        raise ValueError('Contorno não encontrado. Ajuste a tolerância ou marque o contorno manualmente.')
-    # Preenche furos internos por inundação do fundo a partir das bordas.
-    padded = np.pad(mask,1)
-    outside = np.zeros_like(padded)
-    q = deque([(0,0)])
-    outside[0,0] = True
-    while q:
-        y,x = q.popleft()
-        for yy,xx in ((y-1,x),(y+1,x),(y,x-1),(y,x+1)):
-            if 0 <= yy < padded.shape[0] and 0 <= xx < padded.shape[1] and not padded[yy,xx] and not outside[yy,xx]:
-                outside[yy,xx] = True
-                q.append((yy,xx))
-    mask = (~outside)[1:-1,1:-1]
-    ys,xs = np.where(mask)
-    mask = mask[ys.min():ys.max()+1,xs.min():xs.max()+1]
-    if mask.shape[1] > mask.shape[0]:
-        mask = np.rot90(mask)
-    return mask
+        raise ValueError('Contorno não encontrado. Ajuste a tolerância ou marque manualmente.')
+    contours, _ = cv2.findContours(mask.astype('uint8'), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    filled = np.zeros_like(mask, dtype='uint8')
+    cv2.drawContours(filled, [max(contours,key=cv2.contourArea)], -1, 1, cv2.FILLED)
+    ys,xs = np.where(filled)
+    mask = filled[ys.min():ys.max()+1,xs.min():xs.max()+1].astype(bool)
+    return np.rot90(mask) if mask.shape[1] > mask.shape[0] else mask
 
 
-def build_mesh(mask, length=270, base=3, heel=5, arch=12, side='Esquerdo', resolution=72):
-    if length <= 0 or base <= 0 or heel < 0 or arch < 0:
-        raise ValueError('Comprimento e espessura devem ser positivos; alturas não podem ser negativas.')
-    h,w = mask.shape
-    ny = resolution
-    nx = max(8, round(ny*w/h))
-    cells = np.asarray(Image.fromarray(mask).resize((nx,ny), Image.Resampling.NEAREST)).astype(bool)
-    scale = length/ny
-    vertices, faces, lookup = [], [], {}
-    def vertex(x,y,top):
-        key = (x,y,top)
-        if key not in lookup:
-            u,v = x/nx,y/ny
-            medial = .72 if side == 'Esquerdo' else .28
-            z = base + heel*np.exp(-((v-.88)/.19)**2) + arch*np.exp(-((v-.57)/.22)**2-((u-medial)/.24)**2)
-            lookup[key] = len(vertices)
-            vertices.append(((x-nx/2)*scale,(ny-y)*scale,z if top else 0))
-        return lookup[key]
-    def quad(coords):
-        a,b,c,d = [vertex(*p) for p in coords]
-        faces.extend(((a,b,c),(a,c,d)))
-    for y,x in zip(*np.where(cells)):
-        # Clockwise image coordinates become counterclockwise in world XY.
-        ring = [(x,y),(x,y+1),(x+1,y+1),(x+1,y)]
-        quad([(a,b,True) for a,b in ring])
-        quad([(a,b,False) for a,b in reversed(ring)])
-        for i,(dx,dy) in enumerate(((-1,0),(0,1),(1,0),(0,-1))):
-            xx,yy = x+dx,y+dy
-            if not (0 <= xx < nx and 0 <= yy < ny and cells[yy,xx]):
-                a,b = ring[i],ring[(i+1)%4]
-                quad([(*b,True),(*a,True),(*a,False),(*b,False)])
-    return np.array(vertices,float),np.array(faces,int)
+def smooth_outline(mask, smoothing=1.2):
+    contours, _ = cv2.findContours(np.pad(mask.astype('uint8'),1), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        raise ValueError('Silhueta vazia.')
+    p = max(contours,key=cv2.contourArea)[:,0,:].astype(float)-1
+    if len(p) < 4 or cv2.contourArea(p.astype('float32')) < 4:
+        raise ValueError('Silhueta muito estreita.')
+    closed = np.vstack([p,p[0]])
+    d = np.r_[0,np.cumsum(np.linalg.norm(np.diff(closed,axis=0),axis=1))]
+    t = np.linspace(0,d[-1],min(640,max(160,int(d[-1]/2))),endpoint=False)
+    p = np.column_stack([np.interp(t,d,closed[:,i]) for i in range(2)])
+    if smoothing:
+        p = gaussian_filter1d(p,smoothing,axis=0,mode='wrap')
+    p[:,1] *= -1
+    p -= (p.min(axis=0)+p.max(axis=0))/2
+    area = np.sum(p[:,0]*np.roll(p[:,1],-1)-p[:,1]*np.roll(p[:,0],-1))
+    return p if area > 0 else p[::-1].copy()
 
 
-def save_stl(path, vertices, faces):
+def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=100,smoothing=1.2):
+    if not np.isfinite([length,base,heel,arch,resolution,smoothing]).all() or not (20<=length<=600 and .5<=base<=50 and 0<=heel<=80 and 0<=arch<=80 and 24<=resolution<=180 and 0<=smoothing<=5):
+        raise ValueError('Medidas fora dos limites permitidos.')
+    if side not in ('Esquerdo','Direito'):
+        raise ValueError('Selecione Esquerdo ou Direito.')
+    mask = np.asarray(mask,dtype=bool)
+    if mask.ndim != 2 or min(mask.shape)<2:
+        raise ValueError('Silhueta inválida.')
+    p = smooth_outline(mask,smoothing)
+    p *= length/np.ptp(p[:,1])
+    segments = np.column_stack([np.arange(len(p)),np.roll(np.arange(len(p)),-1)])
+    mesh = triangle.triangulate({'vertices':p,'segments':segments},f'pq25a{(length/resolution)**2/2:.6f}Q')
+    xy = mesh['vertices']
+    f = mesh['triangles'].astype(np.int32)
+    ab,ac = xy[f[:,1]]-xy[f[:,0]],xy[f[:,2]]-xy[f[:,0]]
+    flip = ab[:,0]*ac[:,1]-ab[:,1]*ac[:,0] < 0
+    f[flip] = f[flip,::-1]
+    u = (xy[:,0]-p[:,0].min())/np.ptp(p[:,0])
+    v = (p[:,1].max()-xy[:,1])/length
+    medial = .72 if side=='Esquerdo' else .28
+    z = base+heel*np.exp(-((v-.88)/.19)**2)+arch*np.exp(-((v-.57)/.22)**2-((u-medial)/.24)**2)
+    n = len(xy)
+    vertices = np.vstack([np.column_stack([xy,z]),np.column_stack([xy,np.zeros(n)])])
+    edges = np.vstack([f[:,[0,1]],f[:,[1,2]],f[:,[2,0]]])
+    _,inverse,counts = np.unique(np.sort(edges,axis=1),axis=0,return_inverse=True,return_counts=True)
+    a,b = edges[counts[inverse]==1].T
+    walls = np.vstack([np.column_stack([b,a,a+n]),np.column_stack([b,a+n,b+n])])
+    return vertices,np.vstack([f,f[:,::-1]+n,walls]).astype(np.int32)
+
+
+def save_stl(path,vertices,faces):
+    tris = vertices[faces].astype('<f4')
+    normals = np.cross(tris[:,1]-tris[:,0],tris[:,2]-tris[:,0])
+    normals /= np.maximum(np.linalg.norm(normals,axis=1,keepdims=True),1e-12)
+    records = np.zeros(len(faces),dtype=[('normal','<f4',(3,)),('vertices','<f4',(3,3)),('attribute','<u2')])
+    records['normal'],records['vertices'] = normals,tris
     with open(path,'wb') as f:
-        f.write(b'Palmilha3D - millimeters'.ljust(80,b' '))
+        f.write(b'Palmilha Studio - millimeters'.ljust(80,b' '))
         f.write(struct.pack('<I',len(faces)))
-        for face in faces:
-            triangle = vertices[face]
-            normal = np.cross(triangle[1]-triangle[0],triangle[2]-triangle[0])
-            normal /= max(np.linalg.norm(normal),1e-12)
-            f.write(struct.pack('<12fH',*normal,*triangle.flatten(),0))
+        f.write(records.tobytes())
 
 
 def demo_image():
-    im = Image.new('RGB',(220,520),'white')
-    ImageDraw.Draw(im).polygon([(65,22),(110,12),(157,28),(185,70),(194,135),(175,210),(143,290),(143,366),(159,438),(143,487),(106,503),(65,490),(48,453),(49,391),(57,325),(45,250),(27,167),(28,90),(43,43)],fill='#567c40')
-    return im
+    from scipy.interpolate import splprep, splev
+    points = np.array([(65,22),(110,12),(157,28),(185,70),(194,135),(175,210),(143,290),(143,366),(159,438),(143,487),(106,503),(65,490),(48,453),(49,391),(57,325),(45,250),(27,167),(28,90),(43,43),(65,22)])
+    spline,_ = splprep(points.T,s=0,per=True)
+    curve = np.column_stack(splev(np.linspace(0,1,700),spline))*4
+    im = Image.new('RGB',(880,2080),'white')
+    ImageDraw.Draw(im).polygon([tuple(p) for p in curve],fill='#567c40')
+    return im.resize((440,1040),Image.Resampling.LANCZOS)

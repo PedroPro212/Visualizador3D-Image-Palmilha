@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import numpy as np
-from core import demo_image, extract_mask, build_mesh, save_stl
+from core import demo_image, extract_mask, build_mesh, save_stl, smooth_outline
 
 
 class MeshTest(unittest.TestCase):
@@ -42,6 +42,44 @@ class MeshTest(unittest.TestCase):
             extract_mask(Image.new('RGB',(200,400),'white'))
         with self.assertRaises(ValueError):
             build_mesh(np.ones((20,10),bool),base=-1)
+
+    def test_concave_outline_fidelity_and_nondegenerate_faces(self):
+        import cv2
+        mask = extract_mask(demo_image())
+        outline = smooth_outline(mask)
+        raster = np.zeros_like(mask, dtype='uint8')
+        p = outline.copy()
+        p[:,1] *= -1
+        p -= p.min(axis=0)
+        p *= (np.array([mask.shape[1],mask.shape[0]])-1)/np.ptp(p,axis=0)
+        cv2.fillPoly(raster,[np.rint(p).astype('int32')],1)
+        iou = np.logical_and(mask,raster).sum()/np.logical_or(mask,raster).sum()
+        self.assertGreater(iou,.97)
+        vertices,faces = build_mesh(mask)
+        tris = vertices[faces]
+        area = np.linalg.norm(np.cross(tris[:,1]-tris[:,0],tris[:,2]-tris[:,0]),axis=1)/2
+        self.assertTrue((area>1e-8).all())
+        top = tris[(tris[:,:,2]>0).all(axis=1)]
+        top_area = np.abs(np.cross(top[:,1]-top[:,0],top[:,2]-top[:,0])[:,2]).sum()/2
+        outline *= 270/np.ptp(outline[:,1])
+        polygon_area = cv2.contourArea(outline.astype('float32'))
+        self.assertAlmostEqual(top_area,polygon_area,delta=.01)
+
+    def test_nonfinite_and_empty_mesh_input(self):
+        for values in ({'length':float('nan')},{'arch':float('inf')},{'resolution':10000},{'smoothing':-1}):
+            with self.assertRaises(ValueError):
+                build_mesh(np.ones((20,10),bool),**values)
+        with self.assertRaises(ValueError):
+            build_mesh(np.zeros((20,10),bool))
+
+    def test_heel_and_arch_orientation(self):
+        mask = extract_mask(demo_image())
+        left,_ = build_mesh(mask,side='Esquerdo',heel=0)
+        right,_ = build_mesh(mask,side='Direito',heel=0)
+        self.assertGreater(left[left[:,2].argmax(),0],0)
+        self.assertLess(right[right[:,2].argmax(),0],0)
+        heel,_ = build_mesh(mask,arch=0)
+        self.assertLess(heel[heel[:,2].argmax(),1],0)
 
 
 if __name__ == '__main__':
