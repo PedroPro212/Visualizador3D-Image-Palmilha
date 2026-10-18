@@ -6,11 +6,10 @@ import time
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
-from PIL.ImageQt import ImageQt
 from PySide6 import QtCore as C, QtGui as G, QtWidgets as W
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl.shaders import ShaderProgram, VertexShader, FragmentShader
-from core import extract_mask, build_mesh, save_stl, demo_image
+from core import extract_mask, build_mesh, save_stl, mirror_mesh, demo_image
 
 STYLE = '''
 QWidget {font-family: 'Segoe UI'; font-size: 13px; color: #dce5ef; background: #111c2e;}
@@ -47,6 +46,13 @@ def button(text, callback, primary=False):
     item.clicked.connect(callback)
     if primary: item.setObjectName('primary')
     return item
+
+
+def pil_to_qimage(image):
+    """Convert a Pillow image without relying on Pillow's optional Qt binding detection."""
+    rgba=image.convert('RGBA')
+    return G.QImage(rgba.tobytes(),rgba.width,rgba.height,rgba.width*4,
+                    G.QImage.Format_RGBA8888).copy()
 
 
 def foot_surface(sole_vertices, sole_faces, parameters, height, ankle, toe_relief):
@@ -137,7 +143,7 @@ class Preview(W.QWidget):
         self.manual = False
         self.rect = C.QRectF()
     def set_image(self, im):
-        self.image = G.QImage(ImageQt(im.convert('RGBA'))).copy()
+        self.image = pil_to_qimage(im)
         self.update()
     def paintEvent(self, event):
         painter = G.QPainter(self)
@@ -165,6 +171,19 @@ class Preview(W.QWidget):
             self.points.append(((p.x()-self.rect.x())/self.rect.width(),(p.y()-self.rect.y())/self.rect.height()))
             self.update()
             self.changed.emit()
+
+
+class DimensionViewer(gl.GLViewWidget):
+    """3D viewer with double-click editing for dimension callouts."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.dimension_hit = None
+    def mouseDoubleClickEvent(self, event):
+        pos = event.position() if hasattr(event, 'position') else event.localPos()
+        if event.button() == C.Qt.LeftButton and self.dimension_hit and self.dimension_hit(pos):
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class Signals(C.QObject):
@@ -246,6 +265,10 @@ class App(W.QMainWindow):
         self.pressure_item = None
         self.overlay_mode = 0
         self.dimension_items = []
+        self.dimension_labels = []
+        self.dimension_specs = []
+        self.width_targets = {}
+        self.dimension_editor = None
         self.revision = 0
         self.busy = False
         self.cache = None
@@ -309,10 +332,11 @@ class App(W.QMainWindow):
         for title,key,value,low,high,step in [
             ('Tolerância do fundo','tolerance',45,0,441,5),
             ('Comprimento · mm','length',270,20,600,1),
+            ('Escala de largura · %','width_scale',100,30,180,1),
             ('Espessura mínima · mm','base',3,.5,50,.5),
             ('Elevação do calcanhar · mm','heel',5,0,80,.5),
             ('Elevação do arco · mm','arch',12,0,80,.5),
-            ('Suavização do contorno','smoothing',1.2,0,5,.2)]:
+            ('Suavização do contorno','smoothing',2.0,0,5,.2)]:
             row = W.QHBoxLayout()
             row.addWidget(label(title))
             field = W.QDoubleSpinBox()
@@ -396,9 +420,12 @@ class App(W.QMainWindow):
         self.material.currentIndexChanged.connect(self.appearance)
         views.addWidget(self.material)
         area.addLayout(views)
-        self.viewer = gl.GLViewWidget()
+        self.viewer = DimensionViewer()
+        self.viewer.dimension_hit = self.edit_dimension_at
+        self.viewer.setToolTip('Dê dois cliques em uma cota para editar o componente. O modelo atualiza automaticamente.')
         self.viewer.setBackgroundColor('#edf2f4')
-        self.viewer.setCameraPosition(distance=440,elevation=36,azimuth=-48)
+        # Start directly above the footprint so its outline can be compared with the imported image.
+        self.viewer.setCameraPosition(distance=self.values['length'].value()*1.65,elevation=90,azimuth=-90)
         self.viewer.opts['fov'] = 45
         self.grid = gl.GLGridItem()
         self.grid.setSize(400,400)
@@ -409,7 +436,7 @@ class App(W.QMainWindow):
         area.addWidget(self.viewer,1)
         self.metrics = label('Extraindo a silhueta e preparando a superfície…','title')
         area.addWidget(self.metrics)
-        area.addWidget(label('Arraste para girar  •  Roda para zoom  •  Ctrl + arraste para mover','muted'))
+        area.addWidget(label('Dois cliques em uma cota para editar  •  Arraste para girar  •  Roda para zoom  •  Ctrl + arraste para mover','muted'))
         area.addWidget(label('O contorno vem da imagem. Altura, arco e calcanhar são estimados pelos ajustes.','muted'))
         body.addLayout(area,1)
         outer.addLayout(body,1)
@@ -418,7 +445,8 @@ class App(W.QMainWindow):
         C.QTimer.singleShot(100,self.generate)
 
     def parameters(self):
-        return {**{k:v.value() for k,v in self.values.items()},'side':self.side.currentText(),'resolution':100}
+        return {**{k:v.value() for k,v in self.values.items()},'side':self.side.currentText(),'resolution':220,
+                'width_targets':self.width_targets.copy()}
 
     def schedule(self,*args):
         self.revision += 1
@@ -469,7 +497,7 @@ class App(W.QMainWindow):
         self.preview.set_image(image)
         self.cache,self.cache_key = mask,self.job_key
         contour_image = Image.fromarray(np.where(mask[:,:,None],np.array([55,170,145],dtype='uint8'),np.array([242,245,247],dtype='uint8')))
-        self.contour_preview.setPixmap(G.QPixmap.fromImage(G.QImage(ImageQt(contour_image))).scaled(260,190,C.Qt.KeepAspectRatio,C.Qt.SmoothTransformation))
+        self.contour_preview.setPixmap(G.QPixmap.fromImage(pil_to_qimage(contour_image)).scaled(260,190,C.Qt.KeepAspectRatio,C.Qt.SmoothTransformation))
         v,f = self.mesh
         if self.mesh_item is None:
             self.mesh_item = gl.GLMeshItem(meshdata=render_data,smooth=True,shader=self.surface_shader,drawEdges=False)
@@ -478,17 +506,101 @@ class App(W.QMainWindow):
         self.appearance()
         size = np.ptp(v,axis=0)
         for item in self.dimension_items: self.viewer.removeItem(item)
+        self.dimension_items, self.dimension_labels, self.dimension_specs = [], [], []
         lo,hi = v.min(axis=0),v.max(axis=0)
-        x,y0,y1 = hi[0]+15,lo[1],hi[1]
-        lines = np.array([(x,y0,0),(x,y1,0),(x-4,y0,0),(x+4,y0,0),(x-4,y1,0),(x+4,y1,0)],dtype=float)
-        self.dimension_items = [gl.GLLinePlotItem(pos=lines,color=(.3,.43,.49,.7),width=1,mode='lines',antialias=True),
-                                gl.GLTextItem(pos=(x+4,0,0),text=f'{size[1]:.0f} mm',color='#536e7c',font=G.QFont('Segoe UI',10))]
-        for item in self.dimension_items: self.viewer.addItem(item)
+        length=size[1]
+        # Cross sections sampled from the triangulated top surface at five useful foot landmarks.
+        sections=[]
+        for name,key,fraction in [('Largura dos dedos','toe',.10),('Largura metatarsal','metatarsal',.27),('Largura do arco','arch',.55),('Largura do calcanhar','heel',.90)]:
+            yy=hi[1]-fraction*length
+            band=max(1.5,length*.012)
+            sample=v[:len(v)//2]
+            xs=sample[np.abs(sample[:,1]-yy)<=band,0]
+            if len(xs)<2:
+                nearest=np.argsort(np.abs(sample[:,1]-yy))[:max(2,len(sample)//80)]
+                xs=sample[nearest,0]
+            sections.append((name,key,float(xs.max()-xs.min()),yy,float(xs.min()),float(xs.max())))
+        specs=[('Comprimento',float(length),'length',(hi[0]+17,0,0), (hi[0]+17,lo[1],hi[1]))]
+        specs.append(('Largura máxima',float(size[0]),'width',(0,lo[1]-15,0),(lo[0],lo[1]-15,0),(hi[0],lo[1]-15,0)))
+        for i,(name,key,value,yy,x0,x1) in enumerate(sections):
+            xx=lo[0]-18-i*7
+            specs.append((name,value,'region_width',(xx,yy,0),key,(x0,yy,0),(x1,yy,0)))
+        specs.append(('Espessura total',float(size[2]),'height',(hi[0]+25,0,hi[2]),(hi[0]+21,0,0),(hi[0]+21,0,hi[2])))
+        for spec in specs:
+            name,value,kind,anchor,*rest=spec
+            key=rest.pop(0) if kind=='region_width' else None
+            segments=rest
+            for a,b in zip(segments[::2],segments[1::2]):
+                line=gl.GLLinePlotItem(pos=np.array([a,b],dtype=float),color=(.25,.43,.49,.78),width=1.3,mode='lines',antialias=True)
+                self.dimension_items.append(line); self.viewer.addItem(line)
+            text=gl.GLTextItem(pos=anchor,text=f'{name}: {value:.1f} mm',color='#536e7c',font=G.QFont('Segoe UI',9))
+            self.dimension_labels.append(text); self.dimension_specs.append((name,value,kind,key))
+            self.dimension_items.append(text); self.viewer.addItem(text)
         self.metrics.setText(f'{size[1]:.1f} mm comprimento     ×     {size[0]:.1f} mm largura     ×     {size[2]:.1f} mm altura')
         self.status.setText(f'Contorno suavizado  •  {len(f):,} triângulos  •  geração em {elapsed*1000:.0f} ms  •  STL em milímetros')
         self.badge.setText('●  MODELO ATUALIZADO')
         self.export_button.setEnabled(True)
         self.update_overlay()
+
+    def _project_dimension(self, item):
+        point=item.pos
+        viewport=(0,0,self.viewer.width(),self.viewer.height())
+        transform=self.viewer.projectionMatrix(viewport,viewport)*self.viewer.viewMatrix()
+        projected=transform.map(G.QVector3D(float(point[0]),float(point[1]),float(point[2])))
+        if projected.z() < -1 or projected.z() > 1: return None
+        return C.QPointF((projected.x()+1)*self.viewer.width()/2,(1-projected.y())*self.viewer.height()/2)
+
+    def edit_dimension_at(self, pos):
+        if not self.dimension_labels: return False
+        for i,item in enumerate(self.dimension_labels):
+            point=self._project_dimension(item)
+            if point is None: continue
+            text=item.text
+            bounds=G.QFontMetrics(item.font).tightBoundingRect(text)
+            rect=C.QRectF(point.x()-2,point.y()-bounds.height()-6,max(bounds.width()+8,65),bounds.height()+12)
+            if rect.contains(pos):
+                self.open_dimension_editor(i,point)
+                return True
+        return False
+
+    def open_dimension_editor(self,index,point):
+        if self.dimension_editor is not None:
+            self.commit_dimension_edit()
+        name,value,kind,key=self.dimension_specs[index]
+        editor=W.QLineEdit(self.viewer)
+        editor.setObjectName('dimensionEditor')
+        editor.setStyleSheet('QLineEdit#dimensionEditor {background:#ffffff; color:#142438; border:2px solid #20a88c; border-radius:5px; padding:3px 7px; font-size:13px;}')
+        editor.setFixedSize(150,30)
+        editor.setText(f'{value:.1f}')
+        editor.setValidator(G.QRegularExpressionValidator(
+            C.QRegularExpression(r'[0-9]{0,3}(?:[.,][0-9]?)?'),editor))
+        editor.setGeometry(int(point.x()),max(0,int(point.y()-32)),150,30)
+        editor.editingFinished.connect(self.commit_dimension_edit)
+        self.dimension_editor=editor
+        self.dimension_edit_index=index
+        editor.show(); editor.raise_(); editor.setFocus(); editor.selectAll()
+
+    def commit_dimension_edit(self):
+        editor=self.dimension_editor
+        if editor is None: return
+        self.dimension_editor=None
+        index=self.dimension_edit_index
+        text=editor.text().strip().replace(',','.')
+        editor.hide(); editor.deleteLater()
+        try: edited=float(text)
+        except ValueError: return
+        name,value,kind,key=self.dimension_specs[index]
+        edited=max(.5,min(600,edited))
+        if kind=='length':
+            self.values['length'].setValue(max(20,min(600,edited)))
+        elif kind=='width':
+            self.values['width_scale'].setValue(max(30,min(180,self.values['width_scale'].value()*edited/max(value,1e-6))))
+        elif kind=='region_width':
+            self.width_targets[key]=max(10,min(250,edited))
+            self.schedule()
+        elif kind=='height':
+            field=self.values['base']
+            field.setValue(max(.5,min(50,field.value()+edited-value)))
 
     def appearance(self,*args):
         if self.mesh_item:
@@ -596,14 +708,37 @@ class App(W.QMainWindow):
 
     def export(self):
         if self.mesh is None or not self.export_button.isEnabled(): return
-        path,_ = W.QFileDialog.getSaveFileName(self,'Exportar modelo em milímetros','palmilha.stl','STL (*.stl)')
-        if path:
-            if not path.lower().endswith('.stl'): path += '.stl'
-            try:
+        current_side=self.side.currentText()
+        choices=['Par de palmilhas (Esquerdo + Direito)',f'Somente modelo atual ({current_side})']
+        choice,ok=W.QInputDialog.getItem(self,'Exportar STL','Escolha o que deseja exportar:',choices,0,False)
+        if not ok: return
+        export_pair=choice==choices[0]
+        initial='palmilha_par.stl' if export_pair else f'palmilha_{current_side.lower()}.stl'
+        path,_=W.QFileDialog.getSaveFileName(self,'Salvar arquivo STL',initial,'STL (*.stl)')
+        if not path: return
+        if not path.lower().endswith('.stl'): path += '.stl'
+        try:
+            if export_pair:
+                base=Path(path)
+                stem=base.stem.removesuffix('_par')
+                left_path=base.with_name(stem+'_esquerdo.stl')
+                right_path=base.with_name(stem+'_direito.stl')
+                targets=[left_path,right_path]
+                existing=[str(p) for p in targets if p.exists()]
+                if existing and W.QMessageBox.question(self,'Substituir arquivos?',
+                    'Estes arquivos já existem e serão substituídos:\n'+'\n'.join(existing),
+                    W.QMessageBox.Yes|W.QMessageBox.No,W.QMessageBox.No)!=W.QMessageBox.Yes:
+                    return
+                opposite=mirror_mesh(*self.mesh)
+                pair={current_side:self.mesh,'Direito' if current_side=='Esquerdo' else 'Esquerdo':opposite}
+                save_stl(str(left_path),*pair['Esquerdo'])
+                save_stl(str(right_path),*pair['Direito'])
+                self.status.setText(f'Par exportado: {left_path.name} e {right_path.name}')
+            else:
                 save_stl(path,*self.mesh)
                 self.status.setText('STL exportado: '+path)
-            except OSError as exc:
-                W.QMessageBox.warning(self,'Não foi possível exportar',str(exc))
+        except OSError as exc:
+            W.QMessageBox.warning(self,'Não foi possível exportar',str(exc))
 
     def closeEvent(self,event):
         self.timer.stop()
@@ -613,6 +748,12 @@ class App(W.QMainWindow):
 
 def main():
     fmt = G.QSurfaceFormat()
+    # pyqtgraph's GLViewWidget uses legacy matrix calls in its projection setup.
+    # Request a compatibility context so drivers that default to a core profile
+    # do not reject those calls with GL_INVALID_OPERATION (1282).
+    fmt.setRenderableType(G.QSurfaceFormat.OpenGL)
+    fmt.setVersion(2,1)
+    fmt.setProfile(G.QSurfaceFormat.CompatibilityProfile)
     fmt.setSamples(4)
     fmt.setDepthBufferSize(24)
     G.QSurfaceFormat.setDefaultFormat(fmt)

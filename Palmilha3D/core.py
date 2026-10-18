@@ -49,7 +49,8 @@ def smooth_outline(mask, smoothing=1.2):
         raise ValueError('Silhueta muito estreita.')
     closed = np.vstack([p,p[0]])
     d = np.r_[0,np.cumsum(np.linalg.norm(np.diff(closed,axis=0),axis=1))]
-    t = np.linspace(0,d[-1],min(640,max(160,int(d[-1]/2))),endpoint=False)
+    # Sample the source contour densely so STL side walls do not inherit pixel-like facets.
+    t = np.linspace(0,d[-1],min(1800,max(240,int(d[-1]/1.5))),endpoint=False)
     p = np.column_stack([np.interp(t,d,closed[:,i]) for i in range(2)])
     if smoothing:
         p = gaussian_filter1d(p,smoothing,axis=0,mode='wrap')
@@ -59,8 +60,8 @@ def smooth_outline(mask, smoothing=1.2):
     return p if area > 0 else p[::-1].copy()
 
 
-def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=100,smoothing=1.2):
-    if not np.isfinite([length,base,heel,arch,resolution,smoothing]).all() or not (20<=length<=600 and .5<=base<=50 and 0<=heel<=80 and 0<=arch<=80 and 24<=resolution<=180 and 0<=smoothing<=5):
+def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=220,smoothing=1.2,width_scale=100,width_targets=None):
+    if not np.isfinite([length,base,heel,arch,resolution,smoothing,width_scale]).all() or not (20<=length<=600 and .5<=base<=50 and 0<=heel<=80 and 0<=arch<=80 and 24<=resolution<=320 and 0<=smoothing<=5 and 30<=width_scale<=180):
         raise ValueError('Medidas fora dos limites permitidos.')
     if side not in ('Esquerdo','Direito'):
         raise ValueError('Selecione Esquerdo ou Direito.')
@@ -69,6 +70,24 @@ def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=
         raise ValueError('Silhueta inválida.')
     p = smooth_outline(mask,smoothing)
     p *= length/np.ptp(p[:,1])
+    p[:,0] *= width_scale/100
+    targets = width_targets or {}
+    regions = {'toe':(.10,.065),'metatarsal':(.27,.075),'arch':(.55,.075),'heel':(.90,.065)}
+    if any(key not in regions or not np.isfinite(value) or not 10<=value<=250 for key,value in targets.items()):
+        raise ValueError('Largura de componente fora dos limites permitidos.')
+    # Adjust each longitudinal section smoothly while retaining the neighboring outline.
+    for _ in range(5):
+        fraction=(p[:,1].max()-p[:,1])/length
+        for key,target in targets.items():
+            center,sigma=regions[key]
+            band=max(1.,length*.012)
+            section=p[np.abs(fraction-center)*length<=band,0]
+            if len(section)<2:
+                section=p[np.argsort(np.abs(fraction-center))[:max(2,len(p)//100)],0]
+            current=float(section.max()-section.min())
+            ratio=float(target)/max(current,1e-6)
+            influence=np.exp(-.5*((fraction-center)/sigma)**2)
+            p[:,0] *= 1+(ratio-1)*influence
     segments = np.column_stack([np.arange(len(p)),np.roll(np.arange(len(p)),-1)])
     mesh = triangle.triangulate({'vertices':p,'segments':segments},f'pq25a{(length/resolution)**2/2:.6f}Q')
     xy = mesh['vertices']
@@ -99,6 +118,15 @@ def save_stl(path,vertices,faces):
         f.write(b'Palmilha Studio - millimeters'.ljust(80,b' '))
         f.write(struct.pack('<I',len(faces)))
         f.write(records.tobytes())
+
+
+def mirror_mesh(vertices,faces):
+    """Mirror a watertight insole across its longitudinal centerline."""
+    mirrored_vertices=vertices.copy()
+    mirrored_vertices[:,0]*=-1
+    # A reflection reverses handedness; reverse winding to keep outward normals.
+    mirrored_faces=np.asarray(faces)[:,::-1].copy()
+    return mirrored_vertices,mirrored_faces
 
 
 def demo_image():

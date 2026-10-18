@@ -426,3 +426,17 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# Palmilha Studio: ambientes locais, backups e artefatos gerados
+Palmilha3D/.venv*/
+Palmilha3D/.build-tmp/
+Palmilha3D/__pycache__/
+Palmilha3D/backup-*.zip
+Palmilha3D/backup-*.7z
+Palmilha3D/installer/output/
+Palmilha3D/installer/payload/
+Palmilha3D/installer/pyinstaller-build/
+Palmilha3D/installer/temp/
+Palmilha3D/installer/*.spec
+
+Palmilha3D/installer/redist/*.exe
