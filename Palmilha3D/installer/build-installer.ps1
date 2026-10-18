@@ -51,12 +51,33 @@ $pyinstallerArgs = @(
     '--distpath',$payloadDir,
     '--workpath',$workDir,
     '--specpath',$installerRoot,
+    '--runtime-hook',(Join-Path $installerRoot 'pyi_rth_pyside6_dll.py'),
     '--hidden-import','PySide6.QtOpenGLWidgets',
     '--hidden-import','PySide6.QtOpenGL',
     (Join-Path $projectRoot 'app.py')
 )
 & $python @pyinstallerArgs
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed to package the application.' }
+
+$appDir = Join-Path $payloadDir 'PalmilhaStudio'
+$internalDir = Join-Path $appDir '_internal'
+$collectToc = Join-Path $workDir 'PalmilhaStudio\COLLECT-00.toc'
+$pysideDir = [IO.Path]::GetFullPath((Join-Path $projectRoot '.venv-studio\Lib\site-packages\PySide6')) + [IO.Path]::DirectorySeparatorChar
+if (Test-Path -LiteralPath $collectToc) {
+    $tocText = Get-Content -LiteralPath $collectToc -Raw
+    $icuEntries = [regex]::Matches($tocText, "\('(?<name>icu[^']+\.dll)',\s*'(?<source>[^']+)'")
+    foreach ($entry in $icuEntries) {
+        $icuName = $entry.Groups['name'].Value
+        $icuSource = [IO.Path]::GetFullPath($entry.Groups['source'].Value)
+        if (-not $icuSource.StartsWith($pysideDir,[StringComparison]::OrdinalIgnoreCase)) {
+            $bundledIcu = Join-Path $internalDir $icuName
+            if (Test-Path -LiteralPath $bundledIcu) {
+                Remove-Item -LiteralPath $bundledIcu -Force
+                Write-Host "Removed ICU dependency from outside PySide6: $icuName"
+            }
+        }
+    }
+}
 
 $appExe = Join-Path $payloadDir 'PalmilhaStudio\PalmilhaStudio.exe'
 if (-not (Test-Path -LiteralPath $appExe)) { throw 'The packaged executable was not created.' }
@@ -67,8 +88,10 @@ $smokeErr = Join-Path $tempDir 'smoke-err.txt'
 $null = Set-Content -LiteralPath $smokeOut -Value ''
 $null = Set-Content -LiteralPath $smokeErr -Value ''
 $process = $null
+$originalPath = $env:PATH
 try {
-    $process = Start-Process -FilePath $appExe -PassThru -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr
+    $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+    $process = Start-Process -FilePath $appExe -WorkingDirectory $appDir -PassThru -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr
     Start-Sleep -Seconds 8
     if ($process.HasExited) {
         $details = (Get-Content $smokeErr,$smokeOut -ErrorAction SilentlyContinue | Out-String)
@@ -81,6 +104,7 @@ try {
     }
 } finally {
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+    $env:PATH = $originalPath
 }
 
 Write-Host "App payload created and startup checked: $appExe"

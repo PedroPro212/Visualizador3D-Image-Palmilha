@@ -11,7 +11,7 @@ Abra `INICIAR.bat`. É necessário Python 3.11 a 3.14, 64 bits (recomendado: 3.1
 1. Importe ou arraste PNG/JPG/JPEG. Use uma foto vista de cima, fundo uniforme e sem sombras, ou PNG transparente. A imagem é processada localmente e não é enviada a serviços externos.
 2. Confira a aba **Contorno detectado**. A maior região conectada é preservada; furos internos são preenchidos. Imagens horizontais são giradas para definir o comprimento. Confira ponta e calcanhar.
 3. Se necessário, selecione **Marcar contorno**, clique ao redor da palmilha na imagem original e pressione **Concluir**. **Restaurar detecção automática** descarta os pontos manuais.
-4. Informe o comprimento real em mm. Ajuste espessura, calcanhar, arco e lado. Os ajustes atualizam o modelo automaticamente. Suavização maior arredonda pequenas irregularidades e pode remover detalhes; valores menores preservam mais o contorno.
+4. Informe o comprimento real em mm. Ajuste espessura, calcanhar, arco e lado. **Palmilha plana (sem elevação)** conserva o contorno e a espessura mínima, mas remove o arco, a elevação do calcanhar e o relevo SoleMorph. Os ajustes atualizam o modelo automaticamente. Suavização maior arredonda pequenas irregularidades e pode remover detalhes; valores menores preservam mais o contorno.
 5. Arraste para girar, use a roda para zoom e Ctrl + arraste para deslocar. Há vistas superior/lateral, três materiais e exibição da malha.
 6. Clique **Exportar STL** quando o indicador informar que o modelo está atualizado. A exportação fica indisponível enquanto há alterações pendentes. STL não guarda unidades: selecione milímetros no CAD/fatiador.
 
@@ -20,6 +20,14 @@ Abra `INICIAR.bat`. É necessário Python 3.11 a 3.14, 64 bits (recomendado: 3.1
 No seletor acima da visualização, escolha **Pé 3D** para exibir um relevo anatômico sobre a palmilha. O contorno acompanha exatamente a malha da palmilha, incluindo comprimento e largura. Volume do peito do pé, tornozelo e relevo dos dedos podem ser ajustados nos controles. O modelo é uma referência visual paramétrica; ele não é uma digitalização do pé e não é incluído no STL da palmilha.
 
 Escolha **Pressão estimada** para ver um mapa de cores na superfície da palmilha. Os controles ajustam a intensidade relativa no calcanhar, mediopé, metatarsos e dedos. A distribuição é uma ilustração ajustável, não uma medição de pressão plantar. Medidas reais exigem sensores ou uma palmilha instrumentada e validação profissional.
+
+## SoleMorph: palmilha moldada pelo scan
+
+Primeiro carregue a imagem/contorno da palmilha; em seguida use **Importar pé 3D (STL)**. O scan é mantido separado da palmilha. A opção **Moldar a palmilha ao scan** altera a superfície superior da malha da palmilha, preservando o contorno escolhido, a base e a malha fechada para exportação. Desmarque-a para voltar à forma base.
+
+Ajuste a escala e a folga do scan. **Planos de leitura**, **Início** e **Espaçamento entre planos** controlam a faixa plantar usada na conformação. **Posição X/Y** e **Rotação do scan** alinham o scan com a palmilha. **Suavização da superfície** reduz irregularidades do scan, **Transição suave** mistura o relevo com o restante da palmilha, e **Intensidade do relevo** controla quanto o scan eleva o topo; os mesmos ajustes reposicionam a visualização do pé. **Mostrar pé** alterna o scan na visualização sem incluí-lo no STL. **Mapa SoleMorph** colore a superfície pela altura real da forma gerada; ele não representa pressão medida. O mapa **Pressão estimada** continua ilustrativo e ajustável.
+
+O scan deve estar deitado, com o comprimento no eixo Y, altura no Z e a sola voltada para -Z. STL não registra unidade; confira a escala e as dimensões reais antes de imprimir. O modelo gerado é uma aproximação geométrica da superfície plantar e deve ser inspecionado no visualizador e no fatiador antes da fabricação.
 
 ## Geometria e desempenho
 

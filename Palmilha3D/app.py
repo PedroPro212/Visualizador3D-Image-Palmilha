@@ -9,7 +9,8 @@ from PIL import Image, ImageOps
 from PySide6 import QtCore as C, QtGui as G, QtWidgets as W
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl.shaders import ShaderProgram, VertexShader, FragmentShader
-from core import extract_mask, build_mesh, save_stl, mirror_mesh, demo_image
+from core import (extract_mask, build_mesh, save_stl, mirror_mesh, demo_image,
+                  load_stl, normalize_foot_scan, build_sole_morph)
 
 STYLE = '''
 QWidget {font-family: 'Segoe UI'; font-size: 13px; color: #dce5ef; background: #111c2e;}
@@ -113,6 +114,17 @@ def foot_surface(sole_vertices, sole_faces, parameters, height, ankle, toe_relie
     return vertices,closed_faces,colors
 
 
+def morphology_colors(sole_vertices):
+    """Color the molded surface by its actual height; this is not a pressure sensor map."""
+    z=np.asarray(sole_vertices[:,2],dtype=float)
+    lo,hi=np.percentile(z,[5,95])
+    field=np.clip((z-lo)/max(hi-lo,1e-6),0,1)
+    stops=np.array([0,.25,.5,.75,1.])
+    palette=np.array([[.08,.24,.72,.82],[.05,.75,.91,.86],[.20,.78,.44,.90],
+                      [1.,.82,.12,.92],[.92,.12,.10,.94]])
+    return np.column_stack([np.interp(field,stops,palette[:,i]) for i in range(4)])
+
+
 def pressure_colors(sole_vertices, side, levels):
     """Return an adjustable illustrative pressure field, not measured data."""
     lo, hi = sole_vertices.min(axis=0), sole_vertices.max(axis=0)
@@ -191,27 +203,71 @@ class Signals(C.QObject):
 
 
 class Job(C.QRunnable):
-    def __init__(self, revision, source, polygon, params, cached):
+    def __init__(self, revision, source, polygon, params, cached, foot_scan=None):
         super().__init__()
         self.signals = Signals()
-        self.args = revision,source,polygon,params,cached
+        self.args = revision,source,polygon,params,cached,foot_scan
     def run(self):
-        revision,source,polygon,params,cached = self.args
+        revision,source,polygon,params,cached,foot_scan = self.args
         image = None
         try:
             start = time.perf_counter()
-            if isinstance(source,str):
-                with Image.open(source) as opened:
-                    image = ImageOps.exif_transpose(opened)
-                    image.thumbnail((1800,1800),Image.Resampling.LANCZOS)
-                    image = image.convert('RGBA')
-            else: image = source
-            tolerance = params.pop('tolerance')
-            mask = cached if cached is not None else extract_mask(image,tolerance,polygon or None)
-            mesh = build_mesh(mask,**params)
+            if foot_scan is not None:
+                if isinstance(source,str):
+                    with Image.open(source) as opened:
+                        image=ImageOps.exif_transpose(opened)
+                        image.thumbnail((1800,1800),Image.Resampling.LANCZOS)
+                        image=image.convert('RGBA')
+                else:
+                    image=source
+                tolerance=params.pop('tolerance')
+                mask=cached if cached is not None else extract_mask(image,tolerance,polygon or None)
+                base_params={k:params[k] for k in ('length','base','heel','arch','side','resolution','smoothing','width_scale','width_targets')}
+                if params.get('flat_insole',False):
+                    base_params['heel']=0
+                    base_params['arch']=0
+                base_mesh=build_mesh(mask,**base_params)
+                if params.get('solemorph',True) and not params.get('flat_insole',False):
+                    mesh=build_sole_morph(foot_scan,base_mesh,thickness=params['base'],
+                        clearance=params['fit_clearance'],plantar_limit=params['fit_crop'],
+                        resolution=params['resolution'],smoothing=params['smoothing'],
+                        planes=params['morph_planes'],start_at=params['morph_start'],
+                        plane_spacing=params['morph_spacing'],
+                        offset_x=params['morph_offset_x'],offset_y=params['morph_offset_y'],
+                        rotation_deg=params['morph_rotation'],
+                        surface_smoothing=params['morph_smoothing'],blend_distance=params['morph_blend'],
+                        morph_strength=params['morph_strength'])
+                else:
+                    mesh=base_mesh
+                params.pop('fit_clearance',None); params.pop('fit_crop',None)
+            else:
+                if isinstance(source,str):
+                    with Image.open(source) as opened:
+                        image = ImageOps.exif_transpose(opened)
+                        image.thumbnail((1800,1800),Image.Resampling.LANCZOS)
+                        image = image.convert('RGBA')
+                else: image = source
+                tolerance = params.pop('tolerance')
+                params.pop('fit_clearance',None)
+                params.pop('fit_crop',None)
+                params.pop('fit_scale',None)
+                flat=params.pop('flat_insole',False)
+                if flat:
+                    params['heel']=0
+                    params['arch']=0
+                params.pop('solemorph',None)
+                for key in ('morph_planes','morph_start','morph_spacing','morph_offset_x','morph_offset_y','morph_rotation','morph_smoothing','morph_blend','morph_strength'): params.pop(key,None)
+                mask = cached if cached is not None else extract_mask(image,tolerance,polygon or None)
+                mesh = build_mesh(mask,**params)
             v,f = mesh
-            z = v[f,2]
-            groups = np.where((z>0).all(axis=1),0,np.where((z==0).all(axis=1),1,2))
+            if foot_scan is not None:
+                half=len(v)//2
+                top=(f<half).all(axis=1)
+                bottom=((f>=half)&(f<2*half)).all(axis=1)
+                groups=np.where(top,0,np.where(bottom,1,2))
+            else:
+                z = v[f,2]
+                groups = np.where((z>0).all(axis=1),0,np.where((z==0).all(axis=1),1,2))
             # Split cap/wall normals and prepare rendering data off the GUI thread.
             render_data = gl.MeshData(vertexes=np.vstack([v,v,v]),faces=f+groups[:,None]*len(v))
             render_data.vertexNormals()
@@ -262,6 +318,9 @@ class App(W.QMainWindow):
         self.mesh = None
         self.mesh_item = None
         self.foot_item = None
+        self.foot_scan = None
+        self.foot_scan_raw = None
+        self.foot_scan_path = None
         self.pressure_item = None
         self.overlay_mode = 0
         self.dimension_items = []
@@ -310,6 +369,10 @@ class App(W.QMainWindow):
         controls.setSpacing(10)
         controls.addWidget(label('01  /  IMAGEM DE ORIGEM','section'))
         controls.addWidget(button('＋  Importar PNG ou JPG',self.open_image,True))
+        controls.addWidget(button('＋  Importar pé 3D (STL)',self.open_foot_stl))
+        controls.addWidget(label('O STL deve estar em milímetros, com o comprimento no eixo Y e a sola voltada para -Z.','muted'))
+        self.scan_filename=label('Nenhum scan de pé carregado','muted')
+        controls.addWidget(self.scan_filename)
         self.filename = label('Exemplo • arraste sua imagem para a janela','muted')
         controls.addWidget(self.filename)
         self.preview = Preview()
@@ -323,10 +386,13 @@ class App(W.QMainWindow):
         self.tabs.addTab(self.contour_preview,'Contorno detectado')
         controls.addWidget(self.tabs)
         manual_row = W.QHBoxLayout()
-        manual_row.addWidget(button('Marcar contorno',self.start_manual))
-        manual_row.addWidget(button('Concluir',self.finish_manual))
+        self.mark_contour_button=button('Marcar contorno',self.start_manual)
+        self.finish_contour_button=button('Concluir',self.finish_manual)
+        manual_row.addWidget(self.mark_contour_button)
+        manual_row.addWidget(self.finish_contour_button)
         controls.addLayout(manual_row)
-        controls.addWidget(button('Restaurar detecção automática',self.reset_manual))
+        self.reset_contour_button=button('Restaurar detecção automática',self.reset_manual)
+        controls.addWidget(self.reset_contour_button)
         controls.addWidget(label('02  /  FORMA E MEDIDAS','section'))
         self.values = {}
         for title,key,value,low,high,step in [
@@ -349,6 +415,48 @@ class App(W.QMainWindow):
             self.values[key] = field
             row.addWidget(field)
             controls.addLayout(row)
+        self.flat_insole=W.QCheckBox('Palmilha plana (sem elevação)')
+        self.flat_insole.setToolTip('Mantém o contorno e a espessura mínima, sem arco, elevação do calcanhar ou relevo do scan.')
+        self.flat_insole.toggled.connect(self.update_flat_mode)
+        controls.addWidget(self.flat_insole)
+        controls.addWidget(label('03  /  ENCAIXE PERSONALIZADO','section'))
+        self.fit_values = {}
+        for title,key,value,low,high,step in [
+            ('Folga sob o pé · mm','fit_clearance',1,0,10,.5),
+            ('Limite plantar · mm','fit_crop',20,10,50,1),
+            ('Escala do STL · %','fit_scale',100,5,100000,1)]:
+            row=W.QHBoxLayout(); row.addWidget(label(title))
+            field=W.QDoubleSpinBox(); field.setRange(low,high); field.setDecimals(1 if step<1 else 0)
+            field.setSingleStep(step); field.setValue(value); field.setFixedWidth(94)
+            if key=='fit_scale': field.valueChanged.connect(self.rescale_foot_scan)
+            else: field.valueChanged.connect(self.schedule)
+            if key=='fit_crop': field.setToolTip('Corta tornozelo e peito do pé do scan. Aumente apenas se o arco plantar estiver sendo cortado.')
+            self.fit_values[key]=field; row.addWidget(field); controls.addLayout(row)
+        for field in self.fit_values.values(): field.setEnabled(False)
+        controls.addWidget(label('O STL não informa unidade. A escala inicial presume milímetros; confira o comprimento real do pé antes de imprimir.','muted'))
+        controls.addWidget(label('SOLE MORPH  /  CONFORMAÇÃO PLANTAR','section'))
+        self.solemorph_toggle=W.QCheckBox('Moldar a palmilha ao scan')
+        self.solemorph_toggle.setChecked(True)
+        self.solemorph_toggle.setEnabled(False)
+        self.solemorph_toggle.toggled.connect(self.schedule)
+        controls.addWidget(self.solemorph_toggle)
+        self.morph_values={}
+        for title,key,value,low,high,step in [
+            ('Planos de leitura','morph_planes',3,1,12,1),
+            ('Início · mm','morph_start',.5,0,20,.5),
+            ('Espaçamento entre planos · mm','morph_spacing',5,.5,20,.5),
+            ('Posição X · mm','morph_offset_x',0,-100,100,1),
+            ('Posição Y · mm','morph_offset_y',0,-100,100,1),
+            ('Rotação do scan · °','morph_rotation',0,-45,45,1),
+            ('Suavização da superfície · mm','morph_smoothing',6,0,10,.5),
+            ('Transição suave · mm','morph_blend',30,2,50,1),
+            ('Intensidade do relevo · %','morph_strength',55,0,100,5)]:
+            row=W.QHBoxLayout(); row.addWidget(label(title))
+            field=W.QDoubleSpinBox(); field.setRange(low,high); field.setDecimals(1 if step<1 else 0)
+            field.setSingleStep(step); field.setValue(value); field.setFixedWidth(94)
+            field.setEnabled(False); field.valueChanged.connect(self.schedule)
+            self.morph_values[key]=field; row.addWidget(field); controls.addLayout(row)
+        controls.addWidget(label('A palmilha mantém seu contorno e base próprios; o scan altera somente a superfície superior.','muted'))
         self.side = W.QComboBox()
         self.side.addItems(['Esquerdo','Direito'])
         self.side.currentTextChanged.connect(self.schedule)
@@ -409,9 +517,13 @@ class App(W.QMainWindow):
             views.addWidget(button(name,lambda checked=False,a=angles:self.view(*a)))
         views.addStretch()
         self.view_mode = W.QComboBox()
-        self.view_mode.addItems(['Palmilha','Pé 3D','Pressão estimada'])
+        self.view_mode.addItems(['Palmilha','Pé 3D','Pressão estimada','Mapa SoleMorph'])
         self.view_mode.currentIndexChanged.connect(self.update_overlay)
         views.addWidget(self.view_mode)
+        self.show_foot = W.QCheckBox('Mostrar pé')
+        self.show_foot.setVisible(False)
+        self.show_foot.toggled.connect(self.toggle_foot_visibility)
+        views.addWidget(self.show_foot)
         self.wire = W.QCheckBox('Malha')
         self.wire.toggled.connect(self.appearance)
         views.addWidget(self.wire)
@@ -437,7 +549,8 @@ class App(W.QMainWindow):
         self.metrics = label('Extraindo a silhueta e preparando a superfície…','title')
         area.addWidget(self.metrics)
         area.addWidget(label('Dois cliques em uma cota para editar  •  Arraste para girar  •  Roda para zoom  •  Ctrl + arraste para mover','muted'))
-        area.addWidget(label('O contorno vem da imagem. Altura, arco e calcanhar são estimados pelos ajustes.','muted'))
+        self.model_note=label('O contorno vem da imagem. Altura, arco e calcanhar são estimados pelos ajustes.','muted')
+        area.addWidget(self.model_note)
         body.addLayout(area,1)
         outer.addLayout(body,1)
         self.status = label('Pronto para criar.','muted')
@@ -445,8 +558,22 @@ class App(W.QMainWindow):
         C.QTimer.singleShot(100,self.generate)
 
     def parameters(self):
-        return {**{k:v.value() for k,v in self.values.items()},'side':self.side.currentText(),'resolution':220,
-                'width_targets':self.width_targets.copy()}
+        return {**{k:v.value() for k,v in self.values.items()},
+                **{k:v.value() for k,v in self.fit_values.items()},
+                'side':self.side.currentText(),'resolution':220,
+                'width_targets':self.width_targets.copy(),
+                'flat_insole':self.flat_insole.isChecked(),
+                'solemorph':self.solemorph_toggle.isChecked(),
+                **{k:v.value() for k,v in self.morph_values.items()}}
+
+    def update_flat_mode(self,flat):
+        self.values['heel'].setEnabled(not flat)
+        self.values['arch'].setEnabled(not flat)
+        has_scan=self.foot_scan is not None
+        self.solemorph_toggle.setEnabled(has_scan and not flat)
+        for field in self.morph_values.values():
+            field.setEnabled(has_scan and not flat)
+        self.schedule()
 
     def schedule(self,*args):
         self.revision += 1
@@ -460,9 +587,9 @@ class App(W.QMainWindow):
         self.badge.setText('GERANDO…')
         self.status.setText('Atualizando a superfície em segundo plano…')
         p = self.parameters()
-        self.job_key = (self.source_id,p['tolerance'],tuple(self.preview.points))
+        self.job_key = (self.source_id,p['tolerance'],p['fit_scale'],p['fit_clearance'],p['fit_crop'],tuple(self.preview.points))
         cached = self.cache if self.cache_key == self.job_key else None
-        self.job = Job(self.revision,self.source,list(self.preview.points),p,cached)
+        self.job = Job(self.revision,self.source,list(self.preview.points),p,cached,self.foot_scan)
         self.job.signals.finished.connect(self.completed)
         self.pool.start(self.job)
 
@@ -480,8 +607,10 @@ class App(W.QMainWindow):
             self.dimension_items = []
             self.mesh = None
             self.export_button.setEnabled(False)
-            self.badge.setText('REVISAR IMAGEM')
+            self.badge.setText('FALHA NO PÉ 3D' if self.foot_scan is not None else 'REVISAR IMAGEM')
             self.status.setText(error)
+            self.metrics.setText('Falha ao gerar o modelo: '+str(error))
+            self.metrics.setToolTip(str(error))
             if self.mesh_item:
                 self.viewer.removeItem(self.mesh_item)
                 self.mesh_item = None
@@ -490,11 +619,11 @@ class App(W.QMainWindow):
                 if item is not None:
                     self.viewer.removeItem(item)
                     setattr(self,attr,None)
-            self.metrics.setText('Ajuste a imagem ou marque o contorno.')
             return
         image,mask,self.mesh,render_data,elapsed = result
-        self.source = image
-        self.preview.set_image(image)
+        if image is not None:
+            self.source = image
+            self.preview.set_image(image)
         self.cache,self.cache_key = mask,self.job_key
         contour_image = Image.fromarray(np.where(mask[:,:,None],np.array([55,170,145],dtype='uint8'),np.array([242,245,247],dtype='uint8')))
         self.contour_preview.setPixmap(G.QPixmap.fromImage(pil_to_qimage(contour_image)).scaled(260,190,C.Qt.KeepAspectRatio,C.Qt.SmoothTransformation))
@@ -537,6 +666,7 @@ class App(W.QMainWindow):
             self.dimension_labels.append(text); self.dimension_specs.append((name,value,kind,key))
             self.dimension_items.append(text); self.viewer.addItem(text)
         self.metrics.setText(f'{size[1]:.1f} mm comprimento     ×     {size[0]:.1f} mm largura     ×     {size[2]:.1f} mm altura')
+        self.metrics.setToolTip('')
         self.status.setText(f'Contorno suavizado  •  {len(f):,} triângulos  •  geração em {elapsed*1000:.0f} ms  •  STL em milímetros')
         self.badge.setText('●  MODELO ATUALIZADO')
         self.export_button.setEnabled(True)
@@ -592,9 +722,15 @@ class App(W.QMainWindow):
         name,value,kind,key=self.dimension_specs[index]
         edited=max(.5,min(600,edited))
         if kind=='length':
-            self.values['length'].setValue(max(20,min(600,edited)))
+            if self.foot_scan is not None:
+                self.fit_values['fit_scale'].setValue(self.fit_values['fit_scale'].value()*edited/max(value,1e-6))
+            else:
+                self.values['length'].setValue(max(20,min(600,edited)))
         elif kind=='width':
-            self.values['width_scale'].setValue(max(30,min(180,self.values['width_scale'].value()*edited/max(value,1e-6))))
+            if self.foot_scan is not None:
+                self.fit_values['fit_scale'].setValue(self.fit_values['fit_scale'].value()*edited/max(value,1e-6))
+            else:
+                self.values['width_scale'].setValue(max(30,min(180,self.values['width_scale'].value()*edited/max(value,1e-6))))
         elif kind=='region_width':
             self.width_targets[key]=max(10,min(250,edited))
             self.schedule()
@@ -610,13 +746,18 @@ class App(W.QMainWindow):
             self.mesh_item.opts['edgeColor'] = (.12,.22,.27,.25)
             self.mesh_item.meshDataChanged()
 
+    def toggle_foot_visibility(self,visible):
+        self.show_foot.setText('Ocultar pé' if visible else 'Mostrar pé')
+        self.show_foot.setToolTip('Clique para ocultar o scan do pé.' if visible else 'Clique para mostrar o scan do pé.')
+        self.update_overlay()
+
     def update_overlay(self,*args):
         if self.mesh is None or self.mesh_item is None or not hasattr(self,'view_mode'):
             return
         mode = self.view_mode.currentIndex()
         if mode != self.overlay_mode:
             self.overlay_mode = mode
-            if mode == 1:
+            if mode in (1,2,3):
                 self.view(36,-48)
         if self.foot_item is not None:
             self.viewer.removeItem(self.foot_item)
@@ -625,24 +766,42 @@ class App(W.QMainWindow):
             self.viewer.removeItem(self.pressure_item)
             self.pressure_item = None
         vertices,faces = self.mesh
-        if mode == 1:
+        if self.foot_scan is not None:
+            if self.show_foot.isChecked():
+                foot_v=self.foot_scan.reshape(-1,3).copy()
+                sole_top=vertices[:len(vertices)//2]
+                foot_center=(foot_v[:,:2].min(axis=0)+foot_v[:,:2].max(axis=0))/2
+                sole_center=(sole_top[:,:2].min(axis=0)+sole_top[:,:2].max(axis=0))/2
+                angle=np.deg2rad(self.morph_values['morph_rotation'].value())
+                rotation=np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+                foot_v[:,:2]=(foot_v[:,:2]-foot_center)@rotation.T+sole_center+np.array([
+                    self.morph_values['morph_offset_x'].value(),self.morph_values['morph_offset_y'].value()])
+                foot_v[:,2]+=float(np.median(sole_top[:,2]))
+                foot_f=np.arange(len(foot_v),dtype=np.int32).reshape(-1,3)
+                foot_colors=np.tile([.86,.52,.35,.30],(len(foot_v),1))
+                self.foot_item = gl.GLMeshItem(vertexes=foot_v,faces=foot_f,vertexColors=foot_colors,
+                    smooth=True,shader=self.surface_shader,drawEdges=False,computeNormals=True)
+                self.foot_item.setGLOptions('translucent')
+                self.viewer.addItem(self.foot_item)
+        elif mode == 1:
             params = self.parameters()
             foot_v,foot_f,foot_colors = foot_surface(vertices,faces,params,
                 self.foot_values['height'].value(),self.foot_values['ankle'].value(),
                 self.foot_values['toe_relief'].value())
             foot_colors = np.vstack([foot_colors,np.tile([.84,.55,.40,1.],(len(foot_colors),1))])
             self.foot_item = gl.GLMeshItem(vertexes=foot_v,faces=foot_f,vertexColors=foot_colors,
-                smooth=True,shader=self.surface_shader,
-                drawEdges=False,computeNormals=True)
+                smooth=True,shader=self.surface_shader,drawEdges=False,computeNormals=True)
             self.viewer.addItem(self.foot_item)
-        elif mode == 2:
+        if mode in (2,3):
             top_count = len(vertices)//2
             top_vertices = vertices[:top_count].copy()
-            face_heights = vertices[faces,2]
-            top_faces = faces[(face_heights > 0).all(axis=1)]
+            top_faces = faces[(faces < top_count).all(axis=1)]
             top_vertices[:,2] += .16
-            levels = [self.pressure_values[k].value()/100 for k in ('heel','midfoot','forefoot','toes')]
-            colors = pressure_colors(top_vertices,self.side.currentText(),levels)
+            if mode==3:
+                colors=morphology_colors(top_vertices)
+            else:
+                levels = [self.pressure_values[k].value()/100 for k in ('heel','midfoot','forefoot','toes')]
+                colors = pressure_colors(top_vertices,self.side.currentText(),levels)
             data = gl.MeshData(vertexes=top_vertices,faces=top_faces,vertexColors=colors)
             self.pressure_item = gl.GLMeshItem(meshdata=data,smooth=True,
                 shader=self.surface_shader,drawEdges=False,computeNormals=True)
@@ -656,7 +815,75 @@ class App(W.QMainWindow):
         path,_ = W.QFileDialog.getOpenFileName(self,'Importar palmilha','','Imagens (*.png *.jpg *.jpeg)')
         if path: self.load(path)
 
+    def open_foot_stl(self):
+        path,_=W.QFileDialog.getOpenFileName(self,'Importar digitalização do pé','','Modelo STL (*.stl)')
+        if not path: return
+        self.load_foot(path)
+
+    def load_foot(self,path):
+        try:
+            raw=load_stl(path)
+            scale=self.fit_values['fit_scale'].value()/100
+            normalized=normalize_foot_scan(raw,scale)
+        except (OSError,ValueError) as exc:
+            W.QMessageBox.warning(self,'Não foi possível importar o pé',str(exc))
+            return
+        self.foot_scan_raw=raw
+        self.foot_scan=normalized
+        self.foot_scan_path=path
+        self.source_id+=1
+        self.scan_filename.setText('Scan: '+Path(path).name)
+        lower_name=Path(path).name.lower()
+        if 'right' in lower_name or 'direit' in lower_name:
+            self.side.setCurrentText('Direito')
+        elif 'left' in lower_name or 'esquerd' in lower_name:
+            self.side.setCurrentText('Esquerdo')
+        for field in self.fit_values.values(): field.setEnabled(True)
+        self.solemorph_toggle.setChecked(True)
+        self.solemorph_toggle.setEnabled(not self.flat_insole.isChecked())
+        for field in self.morph_values.values(): field.setEnabled(not self.flat_insole.isChecked())
+        self.show_foot.blockSignals(True)
+        self.show_foot.setChecked(False)
+        self.show_foot.setText('Mostrar pé')
+        self.show_foot.blockSignals(False)
+        self.show_foot.setToolTip('Clique para mostrar o scan do pé.')
+        self.show_foot.setVisible(True)
+        self.view_mode.setCurrentIndex(0)
+        self.model_note.setText('O scan é usado para moldar a superfície superior. A silhueta e a base da palmilha permanecem independentes e imprimíveis.')
+        self.status.setText('Scan importado. SoleMorph está ativo; confira o alinhamento e a escala antes de exportar.')
+        self.schedule()
+
+    def rescale_foot_scan(self,*args):
+        if self.foot_scan_raw is None: return
+        try:
+            self.foot_scan=normalize_foot_scan(self.foot_scan_raw,self.fit_values['fit_scale'].value()/100)
+        except ValueError as exc:
+            W.QMessageBox.warning(self,'Escala inválida',str(exc))
+            return
+        self.schedule()
+
     def load(self,path):
+        self.foot_scan=None
+        self.foot_scan_raw=None
+        self.foot_scan_path=None
+        self.scan_filename.setText('Nenhum scan de pé carregado')
+        self.solemorph_toggle.setEnabled(False)
+        for field in self.morph_values.values(): field.setEnabled(False)
+        for key in ('tolerance','length','width_scale','heel','arch'):
+            self.values[key].setEnabled(not self.flat_insole.isChecked() if key in ('heel','arch') else True)
+        for field in self.fit_values.values(): field.setEnabled(False)
+        for control in (self.mark_contour_button,self.finish_contour_button,self.reset_contour_button):
+            control.setEnabled(True)
+        if self.foot_item is not None:
+            self.viewer.removeItem(self.foot_item)
+            self.foot_item=None
+        self.view_mode.setCurrentIndex(0)
+        self.show_foot.setChecked(False)
+        self.show_foot.setText('Mostrar pé')
+        self.show_foot.setVisible(False)
+        self.tabs.setTabText(1,'Contorno detectado')
+        self.tabs.setCurrentIndex(0)
+        self.model_note.setText('O contorno vem da imagem. Altura, arco e calcanhar são estimados pelos ajustes.')
         self.source = path
         self.source_id += 1
         self.preview.manual = False
@@ -668,11 +895,15 @@ class App(W.QMainWindow):
         self.schedule()
 
     def dragEnterEvent(self,event):
-        if event.mimeData().hasUrls() and Path(event.mimeData().urls()[0].toLocalFile()).suffix.lower() in ('.png','.jpg','.jpeg'):
+        if event.mimeData().hasUrls() and Path(event.mimeData().urls()[0].toLocalFile()).suffix.lower() in ('.png','.jpg','.jpeg','.stl'):
             event.acceptProposedAction()
 
     def dropEvent(self,event):
-        self.load(event.mimeData().urls()[0].toLocalFile())
+        path=event.mimeData().urls()[0].toLocalFile()
+        if Path(path).suffix.lower()=='.stl':
+            self.load_foot(path)
+        else:
+            self.load(path)
 
     def start_manual(self):
         if isinstance(self.source,str): return
@@ -747,14 +978,17 @@ class App(W.QMainWindow):
 
 
 def main():
+    # Prefer the Windows desktop OpenGL implementation. Qt may otherwise select
+    # an ANGLE/ES or core context that is incompatible with pyqtgraph's legacy GL.
+    W.QApplication.setAttribute(C.Qt.AA_UseDesktopOpenGL, True)
     fmt = G.QSurfaceFormat()
-    # pyqtgraph's GLViewWidget uses legacy matrix calls in its projection setup.
-    # Request a compatibility context so drivers that default to a core profile
-    # do not reject those calls with GL_INVALID_OPERATION (1282).
+    # Request the widely supported OpenGL 2.1 desktop context. Profiles are only
+    # defined for OpenGL 3.2+, so leave this as NoProfile for maximum driver
+    # compatibility with pyqtgraph's legacy OpenGL calls.
     fmt.setRenderableType(G.QSurfaceFormat.OpenGL)
     fmt.setVersion(2,1)
-    fmt.setProfile(G.QSurfaceFormat.CompatibilityProfile)
-    fmt.setSamples(4)
+    fmt.setProfile(G.QSurfaceFormat.NoProfile)
+    fmt.setSamples(0)
     fmt.setDepthBufferSize(24)
     G.QSurfaceFormat.setDefaultFormat(fmt)
     app = W.QApplication(sys.argv)
