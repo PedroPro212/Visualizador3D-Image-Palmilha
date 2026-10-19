@@ -58,7 +58,7 @@ def pil_to_qimage(image):
 
 def foot_surface(sole_vertices, sole_faces, parameters, height, ankle, toe_relief):
     """Sculpt a foot relief over the exact triangulated footprint of the insole."""
-    count = len(sole_vertices)//2
+    count = len(sole_vertices)//3
     sole = sole_vertices[:count]
     lo, hi = sole[:,:2].min(axis=0), sole[:,:2].max(axis=0)
     u = (sole[:,0]-lo[0])/max(hi[0]-lo[0],1e-6)
@@ -260,18 +260,14 @@ class Job(C.QRunnable):
                 mask = cached if cached is not None else extract_mask(image,tolerance,polygon or None)
                 mesh = build_mesh(mask,**params)
             v,f = mesh
-            if foot_scan is not None:
-                half=len(v)//2
-                top=(f<half).all(axis=1)
-                bottom=((f>=half)&(f<2*half)).all(axis=1)
-                groups=np.where(top,0,np.where(bottom,1,2))
-            else:
-                half=len(v)//2
-                top=(f<half).all(axis=1)
-                bottom=((f>=half)&(f<2*half)).all(axis=1)
-                groups=np.where(top,0,np.where(bottom,1,2))
+            layer=len(v)//3
+            top=(f<layer).all(axis=1)
+            bottom=((f>=layer)&(f<2*layer)).all(axis=1)
+            has_middle=(f>=2*layer).any(axis=1)
+            upper_wall=has_middle&(f<layer).any(axis=1)
+            groups=np.select([top,bottom,upper_wall],[0,1,2],default=3)
             # Split cap/wall normals and prepare rendering data off the GUI thread.
-            render_data = gl.MeshData(vertexes=np.vstack([v,v,v]),faces=f+groups[:,None]*len(v))
+            render_data = gl.MeshData(vertexes=np.tile(v,(4,1)),faces=f+groups[:,None]*len(v))
             render_data.vertexNormals()
             render_data.edges()
             self.signals.finished.emit(revision,(image,mask,mesh,render_data,time.perf_counter()-start),'')
@@ -319,6 +315,7 @@ class App(W.QMainWindow):
         self.source = demo_image()
         self.mesh = None
         self.mesh_item = None
+        self.render_data = None
         self.foot_item = None
         self.foot_scan = None
         self.foot_scan_raw = None
@@ -528,7 +525,7 @@ class App(W.QMainWindow):
         heading.addWidget(self.badge)
         area.addLayout(heading)
         views = W.QHBoxLayout()
-        for name,angles in [('Perspectiva',(36,-48)),('Superior',(90,-90)),('Lateral',(5,0))]:
+        for name,angles in [('Perspectiva',(26,-48)),('Superior',(90,-90)),('Lateral',(5,0))]:
             views.addWidget(button(name,lambda checked=False,a=angles:self.view(*a)))
         views.addStretch()
         self.view_mode = W.QComboBox()
@@ -551,8 +548,8 @@ class App(W.QMainWindow):
         self.viewer.dimension_hit = self.edit_dimension_at
         self.viewer.setToolTip('Dê dois cliques em uma cota para editar o componente. O modelo atualiza automaticamente.')
         self.viewer.setBackgroundColor('#edf2f4')
-        # Start directly above the footprint so its outline can be compared with the imported image.
-        self.viewer.setCameraPosition(distance=self.values['length'].value()*1.65,elevation=90,azimuth=-90)
+        # Start at an oblique angle so the wall and lower bevel are visible.
+        self.viewer.setCameraPosition(distance=self.values['length'].value()*1.65,elevation=26,azimuth=-48)
         self.viewer.opts['fov'] = 45
         self.grid = gl.GLGridItem()
         self.grid.setSize(400,400)
@@ -654,6 +651,7 @@ class App(W.QMainWindow):
         contour_image = Image.fromarray(np.where(mask[:,:,None],np.array([55,170,145],dtype='uint8'),np.array([242,245,247],dtype='uint8')))
         self.contour_preview.setPixmap(G.QPixmap.fromImage(pil_to_qimage(contour_image)).scaled(260,190,C.Qt.KeepAspectRatio,C.Qt.SmoothTransformation))
         v,f = self.mesh
+        self.render_data=render_data
         if self.mesh_item is None:
             self.mesh_item = gl.GLMeshItem(meshdata=render_data,smooth=True,shader=self.surface_shader,drawEdges=False)
             self.viewer.addItem(self.mesh_item)
@@ -674,7 +672,7 @@ class App(W.QMainWindow):
         for name,key,fraction in [('Largura dos dedos','toe',.10),('Largura metatarsal','metatarsal',.27),('Largura do arco','arch',.55),('Largura do calcanhar','heel',.90)]:
             yy=hi[1]-fraction*length
             band=max(1.5,length*.012)
-            sample=v[:len(v)//2]
+            sample=v[:len(v)//3]
             xs=sample[np.abs(sample[:,1]-yy)<=band,0]
             if len(xs)<2:
                 nearest=np.argsort(np.abs(sample[:,1]-yy))[:max(2,len(sample)//80)]
@@ -771,8 +769,12 @@ class App(W.QMainWindow):
 
     def appearance(self,*args):
         if self.mesh_item:
-            colors = [(0.21,.70,.58,1),(1,.65,.22,1),(.80,.85,.91,1)]
-            self.mesh_item.setColor(colors[self.material.currentIndex()])
+            palette = [(0.21,.70,.58,1),(1,.65,.22,1),(.80,.85,.91,1)]
+            base=np.asarray(palette[self.material.currentIndex()],dtype=float)
+            shades=(1.0,.58,.82,.38) # top, underside, straight wall, lower bevel
+            colors=np.vstack([np.tile(np.r_[base[:3]*shade,base[3]],(len(self.mesh[0]),1)) for shade in shades])
+            self.render_data.setVertexColors(colors)
+            self.mesh_item.setColor(base)
             self.mesh_item.opts['drawEdges'] = self.wire.isChecked()
             self.mesh_item.opts['edgeColor'] = (.12,.22,.27,.25)
             self.mesh_item.meshDataChanged()
@@ -800,7 +802,7 @@ class App(W.QMainWindow):
         if self.foot_scan is not None:
             if self.show_foot.isChecked():
                 foot_v=self.foot_scan.reshape(-1,3).copy()
-                sole_top=vertices[:len(vertices)//2]
+                sole_top=vertices[:len(vertices)//3]
                 foot_center=(foot_v[:,:2].min(axis=0)+foot_v[:,:2].max(axis=0))/2
                 sole_center=(sole_top[:,:2].min(axis=0)+sole_top[:,:2].max(axis=0))/2
                 angle=np.deg2rad(self.morph_values['morph_rotation'].value())
@@ -824,7 +826,7 @@ class App(W.QMainWindow):
                 smooth=True,shader=self.surface_shader,drawEdges=False,computeNormals=True)
             self.viewer.addItem(self.foot_item)
         if mode in (2,3):
-            top_count = len(vertices)//2
+            top_count = len(vertices)//3
             top_vertices = vertices[:top_count].copy()
             top_faces = faces[(faces < top_count).all(axis=1)]
             top_vertices[:,2] += .16
@@ -874,10 +876,12 @@ class App(W.QMainWindow):
         self.solemorph_toggle.setEnabled(not self.flat_insole.isChecked())
         for field in self.morph_values.values(): field.setEnabled(not self.flat_insole.isChecked())
         self.show_foot.blockSignals(True)
-        self.show_foot.setChecked(False)
-        self.show_foot.setText('Mostrar pé')
+        # SoleMorph starts in scan-placement mode: show the imported foot so
+        # the user can compare its position with the insole immediately.
+        self.show_foot.setChecked(True)
+        self.show_foot.setText('Ocultar pé')
         self.show_foot.blockSignals(False)
-        self.show_foot.setToolTip('Clique para mostrar o scan do pé.')
+        self.show_foot.setToolTip('Clique para ocultar o scan do pé e conferir a palmilha moldada.')
         self.show_foot.setVisible(True)
         self.view_mode.setCurrentIndex(0)
         self.model_note.setText('O scan é usado para moldar a superfície superior. A silhueta e a base da palmilha permanecem independentes e imprimíveis.')

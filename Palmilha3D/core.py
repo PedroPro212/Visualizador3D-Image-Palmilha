@@ -121,11 +121,21 @@ def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=
         outward/=np.maximum(lengths[:,None],1e-8)
         bottom_xy -= outward*(rim_width*rim)[:,None]
     n = len(xy)
-    vertices = np.vstack([np.column_stack([xy,z]),np.column_stack([bottom_xy,bottom_z])])
+    middle_z=(z+bottom_z)/2
+    vertices = np.vstack([np.column_stack([xy,z]),
+                          np.column_stack([bottom_xy,bottom_z]),
+                          np.column_stack([xy,middle_z])])
     edges = np.vstack([f[:,[0,1]],f[:,[1,2]],f[:,[2,0]]])
     _,inverse,counts = np.unique(np.sort(edges,axis=1),axis=0,return_inverse=True,return_counts=True)
     a,b = edges[counts[inverse]==1].T
-    walls = np.vstack([np.column_stack([b,a,a+n]),np.column_stack([b,a+n,b+n])])
+    middle=a+2*n
+    # Keep the upper half of the side wall vertical; the lower half forms the
+    # inward/downward resalto shown in the reference.
+    upper_walls=np.vstack([np.column_stack([b,a,middle]),
+                           np.column_stack([b,middle,b+2*n])])
+    lower_walls=np.vstack([np.column_stack([b+2*n,a+2*n,a+n]),
+                           np.column_stack([b+2*n,a+n,b+n])])
+    walls=np.vstack([upper_walls,lower_walls])
     return vertices,np.vstack([f,f[:,::-1]+n,walls]).astype(np.int32)
 
 
@@ -314,7 +324,7 @@ def build_sole_morph(foot_triangles, base_mesh, thickness=3, clearance=1,
     base_vertices,base_faces=base_mesh
     base_vertices=np.asarray(base_vertices,dtype=np.float64).copy()
     base_faces=np.asarray(base_faces,dtype=np.int32).copy()
-    if len(base_vertices)<8 or len(base_vertices)%2:
+    if len(base_vertices)<12 or len(base_vertices)%3:
         raise ValueError('A malha base da palmilha é inválida.')
     depth=min(float(plantar_limit),float(start_at)+max(1,int(planes)-1)*float(plane_spacing))
     scan_vertices,_,footprint=build_conformed_insole(foot_triangles,thickness=thickness,
@@ -322,7 +332,7 @@ def build_sole_morph(foot_triangles, base_mesh, thickness=3, clearance=1,
         surface_smoothing=surface_smoothing)
     scan_count=len(scan_vertices)//2
     scan_top=scan_vertices[:scan_count]
-    top_count=len(base_vertices)//2
+    top_count=len(base_vertices)//3
     base_top=base_vertices[:top_count]
     scan_xy=scan_top[:,:2]
     scan_lo,scan_hi=scan_xy.min(axis=0),scan_xy.max(axis=0)
@@ -352,6 +362,9 @@ def build_sole_morph(foot_triangles, base_mesh, thickness=3, clearance=1,
     blend=blend*blend*(3-2*blend)
     relief*=blend*(float(morph_strength)/100.0)
     base_top[:,2]+=relief
+    # The intermediate side-wall ring follows half of the top relief so its
+    # upper section stays continuous after SoleMorph deformation.
+    base_vertices[2*top_count:3*top_count,2]+=relief*.5
     # Preserve the original underside, footprint, and watertight side-wall topology.
     return base_vertices,base_faces
 
