@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from scipy.ndimage import distance_transform_edt, gaussian_filter, gaussian_filter1d, map_coordinates
 from scipy.interpolate import LinearNDInterpolator
+from scipy.spatial import cKDTree
 import triangle
 
 
@@ -62,8 +63,8 @@ def smooth_outline(mask, smoothing=1.2):
     return p if area > 0 else p[::-1].copy()
 
 
-def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=220,smoothing=1.2,width_scale=100,width_targets=None):
-    if not np.isfinite([length,base,heel,arch,resolution,smoothing,width_scale]).all() or not (20<=length<=600 and .5<=base<=50 and 0<=heel<=80 and 0<=arch<=80 and 24<=resolution<=320 and 0<=smoothing<=5 and 30<=width_scale<=180):
+def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=220,smoothing=1.2,width_scale=100,width_targets=None,rim_height=0,rim_width=8):
+    if not np.isfinite([length,base,heel,arch,resolution,smoothing,width_scale,rim_height,rim_width]).all() or not (20<=length<=600 and .5<=base<=50 and 0<=heel<=80 and 0<=arch<=80 and 24<=resolution<=320 and 0<=smoothing<=5 and 30<=width_scale<=180 and 0<=rim_height<=20 and .5<=rim_width<=40):
         raise ValueError('Medidas fora dos limites permitidos.')
     if side not in ('Esquerdo','Direito'):
         raise ValueError('Selecione Esquerdo ou Direito.')
@@ -101,8 +102,26 @@ def build_mesh(mask,length=270,base=3,heel=5,arch=12,side='Esquerdo',resolution=
     v = (p[:,1].max()-xy[:,1])/length
     medial = .72 if side=='Esquerdo' else .28
     z = base+heel*np.exp(-((v-.88)/.19)**2)+arch*np.exp(-((v-.57)/.22)**2-((u-medial)/.24)**2)
+    bottom_xy = xy.copy()
+    bottom_z = np.zeros(len(xy),dtype=float)
+    if rim_height > 0:
+        # Recess the underside perimeter inward and downward, fading into the sole.
+        edge_distance,nearest=cKDTree(p).query(xy,workers=-1)
+        rim=np.clip(1-edge_distance/rim_width,0,1)
+        rim=rim*rim*(3-2*rim)
+        bottom_z -= rim_height*rim
+        outward=p[nearest]-xy
+        lengths=np.linalg.norm(outward,axis=1)
+        on_edge=lengths<1e-8
+        if np.any(on_edge):
+            tangent=np.roll(p,-1,axis=0)-np.roll(p,1,axis=0)
+            edge_tangent=tangent[nearest[on_edge]]
+            outward[on_edge]=np.column_stack([edge_tangent[:,1],-edge_tangent[:,0]])
+            lengths[on_edge]=np.linalg.norm(outward[on_edge],axis=1)
+        outward/=np.maximum(lengths[:,None],1e-8)
+        bottom_xy -= outward*(rim_width*rim)[:,None]
     n = len(xy)
-    vertices = np.vstack([np.column_stack([xy,z]),np.column_stack([xy,np.zeros(n)])])
+    vertices = np.vstack([np.column_stack([xy,z]),np.column_stack([bottom_xy,bottom_z])])
     edges = np.vstack([f[:,[0,1]],f[:,[1,2]],f[:,[2,0]]])
     _,inverse,counts = np.unique(np.sort(edges,axis=1),axis=0,return_inverse=True,return_counts=True)
     a,b = edges[counts[inverse]==1].T

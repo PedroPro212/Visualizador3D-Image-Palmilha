@@ -222,7 +222,7 @@ class Job(C.QRunnable):
                     image=source
                 tolerance=params.pop('tolerance')
                 mask=cached if cached is not None else extract_mask(image,tolerance,polygon or None)
-                base_params={k:params[k] for k in ('length','base','heel','arch','side','resolution','smoothing','width_scale','width_targets')}
+                base_params={k:params[k] for k in ('length','base','heel','arch','side','resolution','smoothing','width_scale','width_targets','rim_height','rim_width')}
                 if params.get('flat_insole',False):
                     base_params['heel']=0
                     base_params['arch']=0
@@ -266,8 +266,10 @@ class Job(C.QRunnable):
                 bottom=((f>=half)&(f<2*half)).all(axis=1)
                 groups=np.where(top,0,np.where(bottom,1,2))
             else:
-                z = v[f,2]
-                groups = np.where((z>0).all(axis=1),0,np.where((z==0).all(axis=1),1,2))
+                half=len(v)//2
+                top=(f<half).all(axis=1)
+                bottom=((f>=half)&(f<2*half)).all(axis=1)
+                groups=np.where(top,0,np.where(bottom,1,2))
             # Split cap/wall normals and prepare rendering data off the GUI thread.
             render_data = gl.MeshData(vertexes=np.vstack([v,v,v]),faces=f+groups[:,None]*len(v))
             render_data.vertexNormals()
@@ -419,6 +421,19 @@ class App(W.QMainWindow):
         self.flat_insole.setToolTip('Mantém o contorno e a espessura mínima, sem arco, elevação do calcanhar ou relevo do scan.')
         self.flat_insole.toggled.connect(self.update_flat_mode)
         controls.addWidget(self.flat_insole)
+        self.rim_toggle=W.QCheckBox('Adicionar resalto inferior recuado')
+        self.rim_toggle.setToolTip('Inclina a borda inferior para dentro e para baixo, como na referência, integrado à malha exportada.')
+        self.rim_toggle.toggled.connect(self.update_rim_mode)
+        controls.addWidget(self.rim_toggle)
+        self.rim_values={}
+        for title,key,value,low,high,step in [
+            ('Altura do resalto inferior · mm','rim_height',4,0,20,.5),
+            ('Largura do recuo inferior · mm','rim_width',3,.5,12,.5)]:
+            row=W.QHBoxLayout(); row.addWidget(label(title))
+            field=W.QDoubleSpinBox(); field.setRange(low,high); field.setDecimals(1)
+            field.setSingleStep(step); field.setValue(value); field.setFixedWidth(94)
+            field.setEnabled(False); field.valueChanged.connect(self.schedule)
+            self.rim_values[key]=field; row.addWidget(field); controls.addLayout(row)
         controls.addWidget(label('03  /  ENCAIXE PERSONALIZADO','section'))
         self.fit_values = {}
         for title,key,value,low,high,step in [
@@ -544,6 +559,7 @@ class App(W.QMainWindow):
         self.grid.setSpacing(25,25)
         self.grid.setColor((90,110,125,42))
         self.grid.translate(0,0,-.5)
+        self.grid_z=-.5
         self.viewer.addItem(self.grid)
         area.addWidget(self.viewer,1)
         self.metrics = label('Extraindo a silhueta e preparando a superfície…','title')
@@ -563,6 +579,8 @@ class App(W.QMainWindow):
                 'side':self.side.currentText(),'resolution':220,
                 'width_targets':self.width_targets.copy(),
                 'flat_insole':self.flat_insole.isChecked(),
+                'rim_height':self.rim_values['rim_height'].value() if self.rim_toggle.isChecked() and not self.flat_insole.isChecked() else 0,
+                'rim_width':self.rim_values['rim_width'].value(),
                 'solemorph':self.solemorph_toggle.isChecked(),
                 **{k:v.value() for k,v in self.morph_values.items()}}
 
@@ -573,6 +591,14 @@ class App(W.QMainWindow):
         self.solemorph_toggle.setEnabled(has_scan and not flat)
         for field in self.morph_values.values():
             field.setEnabled(has_scan and not flat)
+        self.rim_toggle.setEnabled(not flat)
+        for field in self.rim_values.values():
+            field.setEnabled(self.rim_toggle.isChecked() and not flat)
+        self.schedule()
+
+    def update_rim_mode(self,enabled):
+        for field in self.rim_values.values():
+            field.setEnabled(enabled and not self.flat_insole.isChecked())
         self.schedule()
 
     def schedule(self,*args):
@@ -637,6 +663,11 @@ class App(W.QMainWindow):
         for item in self.dimension_items: self.viewer.removeItem(item)
         self.dimension_items, self.dimension_labels, self.dimension_specs = [], [], []
         lo,hi = v.min(axis=0),v.max(axis=0)
+        # Keep the floor grid below the lowest STL vertex so it cannot show
+        # through the downward-projecting underside rim.
+        grid_z=min(-.5,float(lo[2])-2.0)
+        self.grid.translate(0,0,grid_z-self.grid_z)
+        self.grid_z=grid_z
         length=size[1]
         # Cross sections sampled from the triangulated top surface at five useful foot landmarks.
         sections=[]
