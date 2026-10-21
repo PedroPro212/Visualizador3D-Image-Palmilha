@@ -5,12 +5,14 @@ import sys
 import time
 from pathlib import Path
 import numpy as np
+from scipy.ndimage import gaussian_filter, map_coordinates
 from PIL import Image, ImageOps
 from PySide6 import QtCore as C, QtGui as G, QtWidgets as W
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl.shaders import ShaderProgram, VertexShader, FragmentShader
 from core import (extract_mask, build_mesh, save_stl, mirror_mesh, demo_image,
-                  load_stl, normalize_foot_scan, build_sole_morph)
+                  load_stl, normalize_foot_scan, build_sole_morph,
+                  build_conformed_insole)
 
 STYLE = '''
 QWidget {font-family: 'Segoe UI'; font-size: 13px; color: #dce5ef; background: #111c2e;}
@@ -125,8 +127,12 @@ def morphology_colors(sole_vertices):
     return np.column_stack([np.interp(field,stops,palette[:,i]) for i in range(4)])
 
 
-def pressure_colors(sole_vertices, side, levels):
-    """Return an adjustable illustrative pressure field, not measured data."""
+def pressure_colors(sole_vertices, side, levels, scan_surface=None, scan_query=None):
+    """Return a regional estimate modulated by the scanned plantar geometry.
+
+    The scan has no pressure sensor data; plantar prominences only influence
+    the visual estimate and must not be interpreted as measured pressure.
+    """
     lo, hi = sole_vertices.min(axis=0), sole_vertices.max(axis=0)
     width, length = hi[0]-lo[0], hi[1]-lo[1]
     u = (sole_vertices[:,0]-lo[0])/max(width,1e-6)
@@ -138,6 +144,23 @@ def pressure_colors(sole_vertices, side, levels):
              levels[1]*spot(medial,.56,.20,.13) +
              levels[2]*(spot(.34,.29,.13,.09)+spot(.66,.29,.13,.09))*.5 +
              levels[3]*spot(.53,.09,.18,.09))
+    if scan_surface is not None and scan_query is not None:
+        surface,footprint,x_min,y_min,pixels_per_mm=scan_surface
+        gx=(scan_query[:,0]-x_min)*pixels_per_mm
+        gy=(scan_query[:,1]-y_min)*pixels_per_mm
+        inside=map_coordinates(footprint.astype(np.float32),[gy,gx],order=1,
+                               mode='constant',cval=0)>.45
+        # Broad local relief highlights plantar prominences while ignoring
+        # triangle-to-triangle noise in the source STL.
+        broad=gaussian_filter(surface, sigma=18*pixels_per_mm, mode='nearest')
+        local=gaussian_filter(surface, sigma=5*pixels_per_mm, mode='nearest')
+        relief=np.abs(map_coordinates(local-broad,[gy,gx],order=1,mode='nearest'))
+        valid=relief[inside]
+        scale=float(np.percentile(valid,90)) if valid.size else 0.0
+        relief=np.clip(relief/max(scale,1e-5),0,1)
+        # Keep the anatomy-based regional controls, then let the real scan
+        # surface shape where the hottest zones appear.
+        field*=np.where(inside,.55+.9*relief,0.)
     field /= max(float(field.max()),1e-9)
     stops = np.array([0,.25,.5,.75,1.])
     palette = np.array([[.08,.24,.72,.78],[.05,.75,.91,.82],[.20,.78,.44,.86],
@@ -210,6 +233,8 @@ class Job(C.QRunnable):
     def run(self):
         revision,source,polygon,params,cached,foot_scan = self.args
         image = None
+        scan_anchor_z = None
+        pressure_surface = None
         try:
             start = time.perf_counter()
             if foot_scan is not None:
@@ -227,18 +252,27 @@ class Job(C.QRunnable):
                     base_params['heel']=0
                     base_params['arch']=0
                 base_mesh=build_mesh(mask,**base_params)
+                # Keep a stable vertical reference shared by the generated mold
+                # and the visible scan overlay.
+                base_top_count=len(base_mesh[0])//3
+                scan_anchor_z=float(np.median(base_mesh[0][:base_top_count,2]))
                 if params.get('solemorph',True) and not params.get('flat_insole',False):
-                    mesh=build_sole_morph(foot_scan,base_mesh,thickness=params['base'],
+                    mesh,pressure_surface=build_sole_morph(foot_scan,base_mesh,thickness=params['base'],
                         clearance=params['fit_clearance'],plantar_limit=params['fit_crop'],
                         resolution=params['resolution'],smoothing=params['smoothing'],
-                        planes=params['morph_planes'],start_at=params['morph_start'],
-                        plane_spacing=params['morph_spacing'],
                         offset_x=params['morph_offset_x'],offset_y=params['morph_offset_y'],
                         rotation_deg=params['morph_rotation'],
                         surface_smoothing=params['morph_smoothing'],blend_distance=params['morph_blend'],
-                        morph_strength=params['morph_strength'])
+                        morph_strength=params['morph_strength'],sink_depth=params['morph_sink'],
+                        return_surface=True)
                 else:
                     mesh=base_mesh
+                    _,_,footprint,plantar_surface,x_min,y_min,pixels_per_mm=build_conformed_insole(
+                        foot_scan,thickness=params['base'],clearance=0,
+                        plantar_limit=params['fit_crop'],resolution=params['resolution'],
+                        smoothing=params['smoothing'],surface_smoothing=params['morph_smoothing'],
+                        return_surface=True)
+                    pressure_surface=(plantar_surface,footprint,x_min,y_min,pixels_per_mm)
                 params.pop('fit_clearance',None); params.pop('fit_crop',None)
             else:
                 if isinstance(source,str):
@@ -256,7 +290,7 @@ class Job(C.QRunnable):
                     params['heel']=0
                     params['arch']=0
                 params.pop('solemorph',None)
-                for key in ('morph_planes','morph_start','morph_spacing','morph_offset_x','morph_offset_y','morph_rotation','morph_smoothing','morph_blend','morph_strength'): params.pop(key,None)
+                for key in ('morph_planes','morph_start','morph_spacing','morph_offset_x','morph_offset_y','morph_rotation','morph_smoothing','morph_blend','morph_strength','morph_sink'): params.pop(key,None)
                 mask = cached if cached is not None else extract_mask(image,tolerance,polygon or None)
                 mesh = build_mesh(mask,**params)
             v,f = mesh
@@ -270,7 +304,7 @@ class Job(C.QRunnable):
             render_data = gl.MeshData(vertexes=np.tile(v,(4,1)),faces=f+groups[:,None]*len(v))
             render_data.vertexNormals()
             render_data.edges()
-            self.signals.finished.emit(revision,(image,mask,mesh,render_data,time.perf_counter()-start),'')
+            self.signals.finished.emit(revision,(image,mask,mesh,render_data,time.perf_counter()-start,scan_anchor_z,pressure_surface),'')
         except Exception as exc:
             self.signals.finished.emit(revision,image,str(exc))
 
@@ -320,6 +354,8 @@ class App(W.QMainWindow):
         self.foot_scan = None
         self.foot_scan_raw = None
         self.foot_scan_path = None
+        self.scan_anchor_z = None
+        self.pressure_surface = None
         self.pressure_item = None
         self.overlay_mode = 0
         self.dimension_items = []
@@ -454,21 +490,19 @@ class App(W.QMainWindow):
         controls.addWidget(self.solemorph_toggle)
         self.morph_values={}
         for title,key,value,low,high,step in [
-            ('Planos de leitura','morph_planes',3,1,12,1),
-            ('Início · mm','morph_start',.5,0,20,.5),
-            ('Espaçamento entre planos · mm','morph_spacing',5,.5,20,.5),
             ('Posição X · mm','morph_offset_x',0,-100,100,1),
             ('Posição Y · mm','morph_offset_y',0,-100,100,1),
+            ('Afundamento do pé · mm','morph_sink',0,0,25,.5),
             ('Rotação do scan · °','morph_rotation',0,-45,45,1),
-            ('Suavização da superfície · mm','morph_smoothing',6,0,10,.5),
-            ('Transição suave · mm','morph_blend',30,2,50,1),
-            ('Intensidade do relevo · %','morph_strength',55,0,100,5)]:
+            ('Suavização da superfície · mm','morph_smoothing',2,0,10,.5),
+            ('Transição suave · mm','morph_blend',20,2,50,1),
+            ('Intensidade da cavidade · %','morph_strength',100,0,100,5)]:
             row=W.QHBoxLayout(); row.addWidget(label(title))
             field=W.QDoubleSpinBox(); field.setRange(low,high); field.setDecimals(1 if step<1 else 0)
             field.setSingleStep(step); field.setValue(value); field.setFixedWidth(94)
             field.setEnabled(False); field.valueChanged.connect(self.schedule)
             self.morph_values[key]=field; row.addWidget(field); controls.addLayout(row)
-        controls.addWidget(label('A palmilha mantém seu contorno e base próprios; o scan altera somente a superfície superior.','muted'))
+        controls.addWidget(label('A cavidade é calculada por amostragem vertical do scan e só rebaixa a superfície; não cria elevações. A base fica fixa e conserva ao menos 0,8 mm de parede.','muted'))
         self.side = W.QComboBox()
         self.side.addItems(['Esquerdo','Direito'])
         self.side.currentTextChanged.connect(self.schedule)
@@ -510,7 +544,7 @@ class App(W.QMainWindow):
             self.pressure_values[key] = field
             row.addWidget(field)
             controls.addLayout(row)
-        controls.addWidget(label('Mapa ilustrativo, sem sensores: não mede a pressão real nem substitui avaliação clínica.','muted'))
+        controls.addWidget(label('Com scan STL, o relevo plantar influencia o mapa. É uma estimativa visual, não uma medição de pressão nem avaliação clínica.','muted'))
         controls.addWidget(button('↕  Inverter ponta e calcanhar',self.flip))
         controls.addWidget(label('Ponta para cima, calcanhar para baixo. O lado selecionado posiciona o arco.','muted'))
         controls.addStretch()
@@ -643,7 +677,7 @@ class App(W.QMainWindow):
                     self.viewer.removeItem(item)
                     setattr(self,attr,None)
             return
-        image,mask,self.mesh,render_data,elapsed = result
+        image,mask,self.mesh,render_data,elapsed,self.scan_anchor_z,self.pressure_surface = result
         if image is not None:
             self.source = image
             self.preview.set_image(image)
@@ -769,7 +803,7 @@ class App(W.QMainWindow):
 
     def appearance(self,*args):
         if self.mesh_item:
-            palette = [(0.21,.70,.58,1),(1,.65,.22,1),(.80,.85,.91,1)]
+            palette = [(.70,.84,.30,1),(1,.65,.22,1),(.80,.85,.91,1)]
             base=np.asarray(palette[self.material.currentIndex()],dtype=float)
             shades=(1.0,.58,.82,.38) # top, underside, straight wall, lower bevel
             colors=np.vstack([np.tile(np.r_[base[:3]*shade,base[3]],(len(self.mesh[0]),1)) for shade in shades])
@@ -809,9 +843,14 @@ class App(W.QMainWindow):
                 rotation=np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
                 foot_v[:,:2]=(foot_v[:,:2]-foot_center)@rotation.T+sole_center+np.array([
                     self.morph_values['morph_offset_x'].value(),self.morph_values['morph_offset_y'].value()])
-                foot_v[:,2]+=float(np.median(sole_top[:,2]))
+                # Show the scan at the exact placement used by SoleMorph so
+                # its plantar surface remains registered with the molded top.
+                anchor_z=self.scan_anchor_z
+                if anchor_z is None:
+                    anchor_z=float(np.median(sole_top[:,2]))
+                foot_v[:,2]+=anchor_z-self.morph_values['morph_sink'].value()
                 foot_f=np.arange(len(foot_v),dtype=np.int32).reshape(-1,3)
-                foot_colors=np.tile([.86,.52,.35,.30],(len(foot_v),1))
+                foot_colors=np.tile([.48,.72,.22,.40],(len(foot_v),1))
                 self.foot_item = gl.GLMeshItem(vertexes=foot_v,faces=foot_f,vertexColors=foot_colors,
                     smooth=True,shader=self.surface_shader,drawEdges=False,computeNormals=True)
                 self.foot_item.setGLOptions('translucent')
@@ -834,7 +873,18 @@ class App(W.QMainWindow):
                 colors=morphology_colors(top_vertices)
             else:
                 levels = [self.pressure_values[k].value()/100 for k in ('heel','midfoot','forefoot','toes')]
-                colors = pressure_colors(top_vertices,self.side.currentText(),levels)
+                scan_query=None
+                if self.foot_scan is not None and self.pressure_surface is not None:
+                    foot_points=self.foot_scan.reshape(-1,3)
+                    scan_center=(foot_points[:,:2].min(axis=0)+foot_points[:,:2].max(axis=0))/2
+                    sole_center=(top_vertices[:,:2].min(axis=0)+top_vertices[:,:2].max(axis=0))/2
+                    base_center=sole_center+np.array([self.morph_values['morph_offset_x'].value(),
+                                                      self.morph_values['morph_offset_y'].value()])
+                    angle=np.deg2rad(self.morph_values['morph_rotation'].value())
+                    rotation=np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+                    scan_query=(top_vertices[:,:2]-base_center)@rotation+scan_center
+                colors = pressure_colors(top_vertices,self.side.currentText(),levels,
+                                         self.pressure_surface,scan_query)
             data = gl.MeshData(vertexes=top_vertices,faces=top_faces,vertexColors=colors)
             self.pressure_item = gl.GLMeshItem(meshdata=data,smooth=True,
                 shader=self.surface_shader,drawEdges=False,computeNormals=True)
@@ -901,6 +951,7 @@ class App(W.QMainWindow):
         self.foot_scan=None
         self.foot_scan_raw=None
         self.foot_scan_path=None
+        self.scan_anchor_z=None
         self.scan_filename.setText('Nenhum scan de pé carregado')
         self.solemorph_toggle.setEnabled(False)
         for field in self.morph_values.values(): field.setEnabled(False)

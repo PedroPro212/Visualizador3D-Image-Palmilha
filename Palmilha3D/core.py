@@ -5,7 +5,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from scipy.ndimage import distance_transform_edt, gaussian_filter, gaussian_filter1d, map_coordinates
-from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import cKDTree
 import triangle
 
@@ -218,12 +217,13 @@ def _smooth_mask_outline(mask,x_min,y_min,pixels_per_mm,smoothing):
     return p if area>0 else p[::-1].copy()
 
 
-def build_conformed_insole(foot_triangles,thickness=3,clearance=1,plantar_limit=20,resolution=220,smoothing=.6,surface_smoothing=0):
+def build_conformed_insole(foot_triangles,thickness=3,clearance=1,plantar_limit=20,resolution=220,smoothing=.6,surface_smoothing=0,return_surface=False):
     """Create a watertight insole whose top follows the scan's lower plantar band.
 
     The scan must use millimeters, length on Y, and vertical on Z. Faces above
-    plantar_limit are ignored to exclude the dorsum and ankle. Clearance is
-    subtracted so the insole sits below the scanned plantar surface.
+    plantar_limit are ignored to exclude the dorsum and ankle. The rasterized
+    lower envelope is also returned on request for direct vertical-ray style
+    sampling, avoiding a second triangulation/interpolation pass.
     """
     tris=np.asarray(foot_triangles,dtype=np.float64)
     if tris.ndim!=3 or tris.shape[1:]!=(3,3) or len(tris)<10 or not np.isfinite(tris).all():
@@ -233,7 +233,9 @@ def build_conformed_insole(foot_triangles,thickness=3,clearance=1,plantar_limit=
 
     pts=tris.reshape(-1,3)
     lo,hi=pts.min(axis=0),pts.max(axis=0)
-    pixels_per_mm=2.0
+    # A finer raster approximates Gensole's vertical ray-to-triangle checks
+    # while keeping the height-field lookup fast for dense sole meshes.
+    pixels_per_mm=3.0
     margin=2.0
     x_min,y_min=lo[:2]-margin
     width=int(np.ceil((hi[0]-x_min+margin)*pixels_per_mm))+2
@@ -303,6 +305,8 @@ def build_conformed_insole(foot_triangles,thickness=3,clearance=1,plantar_limit=
     a,b=edges[counts[inverse]==1].T
     walls=np.vstack([np.column_stack([b,a,a+n]),np.column_stack([b,a+n,b+n])])
     mesh_faces=np.vstack([faces,faces[:,::-1]+n,walls]).astype(np.int32)
+    if return_surface:
+        return vertices,mesh_faces,footprint,plantar_filled,x_min,y_min,pixels_per_mm
     return vertices,mesh_faces,footprint
 
 
@@ -310,26 +314,32 @@ def build_sole_morph(foot_triangles, base_mesh, thickness=3, clearance=1,
                      plantar_limit=20, resolution=220, smoothing=.6,
                      planes=3, start_at=.5, plane_spacing=5,
                      offset_x=0, offset_y=0, rotation_deg=0,
-                     surface_smoothing=6, blend_distance=30, morph_strength=55):
+                     surface_smoothing=2, blend_distance=20, morph_strength=100,
+                     sink_depth=0, return_surface=False):
     """Morph only the top of a separate insole using the plantar scan surface.
 
-    The silhouette and bottom of base_mesh stay intact. Scan scale is preserved;
-    its plantar relief is sampled in the centered XY frame with user offsets.
+    The silhouette and bottom of base_mesh stay intact. The plantar surface is
+    placed in the same vertical frame as the insole so scan height and sink
+    directly determine the target surface, with the configured clearance.
     """
-    if (not np.isfinite([planes,start_at,plane_spacing,offset_x,offset_y,rotation_deg,surface_smoothing,blend_distance,morph_strength]).all() or
+    if (not np.isfinite([planes,start_at,plane_spacing,offset_x,offset_y,rotation_deg,surface_smoothing,blend_distance,morph_strength,sink_depth]).all() or
             not (1<=planes<=12 and 0<=start_at<=20 and .5<=plane_spacing<=20 and
                  -100<=offset_x<=100 and -100<=offset_y<=100 and -45<=rotation_deg<=45 and
-                 0<=surface_smoothing<=10 and 2<=blend_distance<=50 and 0<=morph_strength<=100)):
+                 0<=surface_smoothing<=10 and 2<=blend_distance<=50 and 0<=morph_strength<=100 and
+                 0<=sink_depth<=25)):
         raise ValueError('Parâmetros SoleMorph fora dos limites permitidos.')
     base_vertices,base_faces=base_mesh
     base_vertices=np.asarray(base_vertices,dtype=np.float64).copy()
     base_faces=np.asarray(base_faces,dtype=np.int32).copy()
     if len(base_vertices)<12 or len(base_vertices)%3:
         raise ValueError('A malha base da palmilha é inválida.')
-    depth=min(float(plantar_limit),float(start_at)+max(1,int(planes)-1)*float(plane_spacing))
-    scan_vertices,_,footprint=build_conformed_insole(foot_triangles,thickness=thickness,
-        clearance=0,plantar_limit=max(5,depth),resolution=resolution,smoothing=smoothing,
-        surface_smoothing=surface_smoothing)
+    # Gensole's slicing planes create separate modifier zones. They do not
+    # limit the foot-to-insole contour, which is evaluated against the plantar
+    # scan itself up to its configured vertical crop.
+    (scan_vertices,_,footprint,plantar_surface,raster_x_min,raster_y_min,
+     pixels_per_mm)=build_conformed_insole(foot_triangles,thickness=thickness,
+        clearance=0,plantar_limit=float(plantar_limit),resolution=resolution,
+        smoothing=smoothing,surface_smoothing=surface_smoothing,return_surface=True)
     scan_count=len(scan_vertices)//2
     scan_top=scan_vertices[:scan_count]
     top_count=len(base_vertices)//3
@@ -343,30 +353,39 @@ def build_sole_morph(foot_triangles, base_mesh, thickness=3, clearance=1,
     base_center=(base_lo+base_hi)/2+np.array([float(offset_x),float(offset_y)])
     angle=np.deg2rad(float(rotation_deg))
     rotation=np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
-    aligned_xy=(scan_xy-scan_center)@rotation.T+base_center
     query=(base_top[:,:2]-base_center)@rotation+scan_center
-    plantar=scan_top[:,2]
-    linear=LinearNDInterpolator(aligned_xy,plantar,fill_value=np.nan)
-    sampled=np.asarray(linear(query),dtype=np.float64)
-    # Fade the scan relief smoothly to the original surface at its footprint edge.
-    baseline=float(np.percentile(plantar,10))
-    sampled[~np.isfinite(sampled)]=baseline
-    relief=np.clip(sampled-baseline-float(clearance),0,max(1.,depth))
+    gx=(query[:,0]-raster_x_min)*pixels_per_mm
+    gy=(query[:,1]-raster_y_min)*pixels_per_mm
+    sampled=map_coordinates(plantar_surface,[gy,gx],order=1,mode='nearest').astype(np.float64)
+    # Match the scan's absolute plantar height to the insole before deforming.
+    # This makes moving the scan vertically change the resulting mold, instead
+    # of merely shifting a height profile relative to its own median.
+    base_top_z=base_top[:,2].copy()
+    anchor_z=float(np.median(base_top_z))
+    sampled[~np.isfinite(sampled)]=0.0
+    target_top_z=sampled+anchor_z-float(sink_depth)-float(clearance)
     inside=footprint.astype(bool)
     signed_distance=distance_transform_edt(inside)-distance_transform_edt(~inside)
-    # The raster in build_conformed_insole uses 2 px/mm with a 2 mm border.
-    gx=(query[:,0]-(scan_lo[0]-2.0))*2.0
-    gy=(query[:,1]-(scan_lo[1]-2.0))*2.0
-    distance_mm=map_coordinates(signed_distance,[gy,gx],order=1,mode='constant',cval=-1)/2.0
+    distance_mm=map_coordinates(signed_distance,[gy,gx],order=1,mode='constant',cval=-1)/pixels_per_mm
     blend=np.clip(distance_mm/float(blend_distance),0,1)
     blend=blend*blend*(3-2*blend)
-    relief*=blend*(float(morph_strength)/100.0)
-    base_top[:,2]+=relief
-    # The intermediate side-wall ring follows half of the top relief so its
-    # upper section stays continuous after SoleMorph deformation.
-    base_vertices[2*top_count:3*top_count,2]+=relief*.5
+    # Sink the scan and its matching plantar mold together. Preserve a minimum
+    # printable wall even when the requested depth exceeds the local base.
+    # SoleMorph is subtractive: the scan may carve the existing footbed down,
+    # but must never add a raised bump above the original insole surface.
+    deformation=np.minimum(target_top_z-base_top_z,0.0)*(float(morph_strength)/100.0)*blend
+    bottom_z=base_vertices[top_count:2*top_count,2]
+    minimum_wall=min(.8,float(thickness))
+    base_top[:,2]=np.maximum(base_top[:,2]+deformation,bottom_z+minimum_wall)
+    # Keep the middle ring halfway between the deformed top and fixed underside.
+    base_vertices[2*top_count:3*top_count,2]=(base_top[:,2]+bottom_z)*.5
     # Preserve the original underside, footprint, and watertight side-wall topology.
-    return base_vertices,base_faces
+    mesh=(base_vertices,base_faces)
+    if return_surface:
+        # Reuse the exact plantar height field that drove the mold to build a
+        # geometry-informed pressure estimate in the viewer.
+        return mesh,(plantar_surface,footprint,raster_x_min,raster_y_min,pixels_per_mm)
+    return mesh
 
 
 def demo_image():
