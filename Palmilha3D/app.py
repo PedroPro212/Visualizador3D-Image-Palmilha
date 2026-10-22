@@ -290,7 +290,7 @@ class Job(C.QRunnable):
                     params['heel']=0
                     params['arch']=0
                 params.pop('solemorph',None)
-                for key in ('morph_planes','morph_start','morph_spacing','morph_offset_x','morph_offset_y','morph_rotation','morph_smoothing','morph_blend','morph_strength','morph_sink'): params.pop(key,None)
+                for key in ('morph_planes','morph_start','morph_spacing','morph_scale','morph_offset_x','morph_offset_y','morph_rotation','morph_smoothing','morph_blend','morph_strength','morph_sink'): params.pop(key,None)
                 mask = cached if cached is not None else extract_mask(image,tolerance,polygon or None)
                 mesh = build_mesh(mask,**params)
             v,f = mesh
@@ -490,6 +490,7 @@ class App(W.QMainWindow):
         controls.addWidget(self.solemorph_toggle)
         self.morph_values={}
         for title,key,value,low,high,step in [
+            ('Escala do pé 3D · %','morph_scale',100,50,200,1),
             ('Posição X · mm','morph_offset_x',0,-100,100,1),
             ('Posição Y · mm','morph_offset_y',0,-100,100,1),
             ('Afundamento do pé · mm','morph_sink',0,0,25,.5),
@@ -646,7 +647,12 @@ class App(W.QMainWindow):
         p = self.parameters()
         self.job_key = (self.source_id,p['tolerance'],p['fit_scale'],p['fit_clearance'],p['fit_crop'],tuple(self.preview.points))
         cached = self.cache if self.cache_key == self.job_key else None
-        self.job = Job(self.revision,self.source,list(self.preview.points),p,cached,self.foot_scan)
+        foot_scan=self.foot_scan
+        if foot_scan is not None:
+            # Keep STL unit calibration separate from the size adjustment.
+            # Uniform scaling from the sole updates both the scan and its mold.
+            foot_scan=foot_scan*(self.morph_values['morph_scale'].value()/100.0)
+        self.job = Job(self.revision,self.source,list(self.preview.points),p,cached,foot_scan)
         self.job.signals.finished.connect(self.completed)
         self.pool.start(self.job)
 
@@ -835,7 +841,8 @@ class App(W.QMainWindow):
         vertices,faces = self.mesh
         if self.foot_scan is not None:
             if self.show_foot.isChecked():
-                foot_v=self.foot_scan.reshape(-1,3).copy()
+                foot_scale=self.morph_values['morph_scale'].value()/100.0
+                foot_v=self.foot_scan.reshape(-1,3).copy()*foot_scale
                 sole_top=vertices[:len(vertices)//3]
                 foot_center=(foot_v[:,:2].min(axis=0)+foot_v[:,:2].max(axis=0))/2
                 sole_center=(sole_top[:,:2].min(axis=0)+sole_top[:,:2].max(axis=0))/2
@@ -875,7 +882,7 @@ class App(W.QMainWindow):
                 levels = [self.pressure_values[k].value()/100 for k in ('heel','midfoot','forefoot','toes')]
                 scan_query=None
                 if self.foot_scan is not None and self.pressure_surface is not None:
-                    foot_points=self.foot_scan.reshape(-1,3)
+                    foot_points=self.foot_scan.reshape(-1,3)*(self.morph_values['morph_scale'].value()/100.0)
                     scan_center=(foot_points[:,:2].min(axis=0)+foot_points[:,:2].max(axis=0))/2
                     sole_center=(top_vertices[:,:2].min(axis=0)+top_vertices[:,:2].max(axis=0))/2
                     base_center=sole_center+np.array([self.morph_values['morph_offset_x'].value(),
